@@ -1,7 +1,6 @@
 use env_logger::Builder;
 use log::{info, error, LevelFilter};
 use tokio::sync::{mpsc, Semaphore, Mutex};
-use tokio::time::Instant;
 use tokio::process::Command;
 use tokio::io::AsyncWriteExt;
 use reqwest::Client;
@@ -17,7 +16,7 @@ use std::collections::HashMap;
 
 mod decryptor;
 
-const MAX_CONCURRENT_DOWNLOADS: usize = 6;
+const MAX_CONCURRENT_DOWNLOADS: usize = 8;
 
 async fn download_with_retry(client: &Client, url: &str, retries: u8) -> Result<Vec<u8>> {
     let mut attempt = 0;
@@ -112,7 +111,7 @@ async fn main() -> Result<()> {
         .init();
 
     let client = Arc::new(Client::new());
-    let m3u8_url = "https://s100-e1.cobiaa.xyz/ppot/_definst_/mp4:s100/hvod_news/XW-E4859A440734-13218.mp4/chunklist.m3u8?vendtime=1730898981&vhash=RtcXlXGVpF1qU6n_ukEzls_zVgMr6ubPn3tPkt_0sSs=&vCustomParameter=0_45.76.150.175.SG_0&lb=8418e923f95a5873e5b6eeb319e9921b&proxy=Sp4mC2rbCIvZRs9fOM4kU7bwV7CnC30jPJ4kOsynDB2n5pmyNfyEPYO61Qoc9Snjx4qiB6NF3oy2";
+    let m3u8_url = "https://anbgvvgzhm88.cdn-jupiter.com/hls2/01/01453/k9n8zgx639mm_n/index-v1-a1.m3u8?t=24D9mmZ80ihPtypK59IC_wLC6kQhbKaG3AA6JJgrsIk&s=1730731634&e=129600&f=7268461&srv=Gs5UDtPpa5&i=0.4&sp=500&p1=Gs5UDtPpa5&p2=Gs5UDtPpa5&asn=20473";
     let (ts_urls, aes_key, aes_iv) = parse_m3u8(m3u8_url, &client).await?;
     info!("解析 M3U8 文件并获取了 AES 密钥和 IV（如果缺失则使用默认 IV）");
 
