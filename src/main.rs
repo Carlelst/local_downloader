@@ -1,6 +1,6 @@
 use env_logger::Builder;
 use log::{info, error, LevelFilter};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, Semaphore, Mutex};
 use tokio::time::Instant;
 use tokio::process::Command;
 use tokio::io::AsyncWriteExt;
@@ -13,17 +13,17 @@ use chrono::Local;
 use std::io::Write;
 use anyhow::Result;
 use std::process::Stdio;
+use std::collections::HashMap;
 
 mod decryptor;
 
-const MAX_CONCURRENT_DOWNLOADS: usize = 4;
+const MAX_CONCURRENT_DOWNLOADS: usize = 6;
 
 async fn download_with_retry(client: &Client, url: &str, retries: u8) -> Result<Vec<u8>> {
     let mut attempt = 0;
     while attempt <= retries {
         match client.get(url).timeout(Duration::from_secs(40)).send().await {
             Ok(response) if response.status().is_success() => {
-                // info!("Successfully downloaded segment from {}", url);
                 return Ok(response.bytes().await?.to_vec());
             }
             Ok(response) => {
@@ -39,27 +39,22 @@ async fn download_with_retry(client: &Client, url: &str, retries: u8) -> Result<
         attempt += 1;
         if attempt <= retries {
             info!("Retrying download for {} (attempt {}/{})", url, attempt, retries);
-            sleep(Duration::from_secs(3)).await; // 每次重试前等待 3 秒
+            sleep(Duration::from_secs(3)).await;
         }
     }
     Err(anyhow::anyhow!("Failed to download segment from {} after {} retries", url, retries))
 }
 
-
 pub async fn parse_m3u8(m3u8_url: &str, client: &Client) -> Result<(Vec<String>, Option<Vec<u8>>, Option<Vec<u8>>)> {
     let response = client.get(m3u8_url).send().await?;
     let m3u8_content = response.text().await?;
 
-    // 提取 TS 文件的 URL 列表
     let ts_urls: Vec<String> = m3u8_content
         .lines()
         .filter(|line| !line.starts_with('#') && !line.is_empty())
         .map(|line| line.to_string())
         .collect();
 
-    // info!("Parsed TS URLs: {:?}", ts_urls);
-
-    // 提取 AES 密钥的 URL 和可选的 IV
     let key_re = Regex::new(r#"EXT-X-KEY:METHOD=AES-128,URI="([^"]+)"(?:,IV=(0x[0-9a-fA-F]+))?"#)?;
     let (key_url, iv) = if let Some(captures) = key_re.captures(&m3u8_content) {
         let key_url = captures.get(1)
@@ -68,10 +63,10 @@ pub async fn parse_m3u8(m3u8_url: &str, client: &Client) -> Result<(Vec<String>,
             .to_string();
 
         let iv = if let Some(iv_match) = captures.get(2) {
-            let iv_hex = &iv_match.as_str()[2..]; // 去掉 "0x" 前缀
+            let iv_hex = &iv_match.as_str()[2..];
             hex::decode(iv_hex).ok()
         } else {
-            Some(vec![0; 16]) // 默认的零 IV
+            Some(vec![0; 16])
         };
 
         (Some(key_url), iv)
@@ -80,7 +75,6 @@ pub async fn parse_m3u8(m3u8_url: &str, client: &Client) -> Result<(Vec<String>,
         (None, None)
     };
 
-    // 如果 key_url 存在则下载 AES 密钥
     let aes_key = if let Some(url) = key_url {
         Some(client.get(&url).send().await?.bytes().await?.to_vec())
     } else {
@@ -89,7 +83,6 @@ pub async fn parse_m3u8(m3u8_url: &str, client: &Client) -> Result<(Vec<String>,
 
     Ok((ts_urls, aes_key, iv))
 }
-
 
 pub async fn start_ffmpeg() -> Result<tokio::process::Child> {
     let ffmpeg = Command::new("ffmpeg")
@@ -105,7 +98,6 @@ pub async fn start_ffmpeg() -> Result<tokio::process::Child> {
         .arg("output.mp4")
         .stdin(Stdio::piped())
         .spawn()?;
-
     Ok(ffmpeg)
 }
 
@@ -120,63 +112,90 @@ async fn main() -> Result<()> {
         .init();
 
     let client = Arc::new(Client::new());
-    let m3u8_url = "https://jid45g65d4qo.cdn-jupiter.com/hls2/01/04745/fqnd6g9i9vym_,l,n,h,.urlset/index-f2-v1-a1.m3u8?t=TDspJK7dbXNHyjcV4GdBJFbm8z0Esu70-3nQH_tkw1w&s=1730662740&e=129600&f=23727860&srv=07s7cile1o9s&i=0.4&sp=500&p1=07s7cile1o9s&p2=07s7cile1o9s&asn=20473";
-
+    let m3u8_url = "https://s100-e1.cobiaa.xyz/ppot/_definst_/mp4:s100/hvod_news/XW-E4859A440734-13218.mp4/chunklist.m3u8?vendtime=1730898981&vhash=RtcXlXGVpF1qU6n_ukEzls_zVgMr6ubPn3tPkt_0sSs=&vCustomParameter=0_45.76.150.175.SG_0&lb=8418e923f95a5873e5b6eeb319e9921b&proxy=Sp4mC2rbCIvZRs9fOM4kU7bwV7CnC30jPJ4kOsynDB2n5pmyNfyEPYO61Qoc9Snjx4qiB6NF3oy2";
     let (ts_urls, aes_key, aes_iv) = parse_m3u8(m3u8_url, &client).await?;
-    info!("Parsed M3U8 file and retrieved AES key and IV(or default IV if missing)");
+    info!("解析 M3U8 文件并获取了 AES 密钥和 IV（如果缺失则使用默认 IV）");
 
-    let (tx, mut rx) = mpsc::channel(32);
-    let mut ffmpeg = start_ffmpeg().await?;
-    let ffmpeg_stdin = ffmpeg.stdin.as_mut().ok_or_else(|| anyhow::anyhow!("Failed to open FFmpeg stdin"))?;
+    let total_segments = ts_urls.len();
+    let segments = Arc::new(Mutex::new(HashMap::<usize, Vec<u8>>::new()));
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
+
+    let mut ffmpeg = start_ffmpeg().await?;
+    let ffmpeg_stdin = ffmpeg.stdin.as_mut().ok_or_else(|| anyhow::anyhow!("无法打开 FFmpeg 的标准输入"))?;
+
+    let (notify_tx, mut notify_rx) = mpsc::channel::<usize>(total_segments);
 
     for (idx, url) in ts_urls.into_iter().enumerate() {
         let client = Arc::clone(&client);
-        let tx = tx.clone();
         let aes_key = aes_key.clone();
         let aes_iv = aes_iv.clone();
         let semaphore = Arc::clone(&semaphore);
+        let segments = Arc::clone(&segments);
+        let notify_tx = notify_tx.clone();
 
         tokio::spawn(async move {
             let _permit = semaphore.acquire().await.unwrap();
-            let segment_start = Instant::now();
 
             match download_with_retry(&client, &url, 10).await {
                 Ok(data) => {
-                    info!("Downloaded segment {} in {:.2?}", idx, segment_start.elapsed());
-                    let decrypt_start = Instant::now();
-                    if let (Some(aes_key), Some(aes_iv)) = (&aes_key, &aes_iv) {
+                    // 解密数据
+                    let decrypted_data = if let (Some(aes_key), Some(aes_iv)) = (&aes_key, &aes_iv) {
                         match decryptor::decrypt_segment(&data, aes_key, aes_iv) {
                             Ok(decrypted_data) => {
-                                info!("Decrypted segment {} in {:.2?}", idx, decrypt_start.elapsed());
-                                tx.send(decrypted_data).await.unwrap();
+                                info!("解密片段 {} 成功", idx);
+                                decrypted_data
                             }
-                            Err(e) => error!("Failed to decrypt segment {}: {:?}", idx, e),
+                            Err(e) => {
+                                error!("解密片段 {} 失败: {:?}", idx, e);
+                                data
+                            }
                         }
                     } else {
-                        // info!("No AES key or IV for segment {} - sending unencrypted data", idx);
-                        tx.send(data).await.unwrap();
-                    }
+                        data
+                    };
+
+                    // 将解密后的数据存储到共享的 HashMap 中
+                    let mut segments_lock = segments.lock().await;
+                    segments_lock.insert(idx, decrypted_data);
+                    drop(segments_lock);
+
+                    // 通知主线程该片段已处理完成
+                    notify_tx.send(idx).await.unwrap();
                 }
-                Err(e) => error!("Failed to download segment {} after retries: {:?}", idx, e),
+                Err(e) => error!("Download {} Failed: {:?}", idx, e),
             }
         });
     }
 
-    drop(tx);
+    drop(notify_tx); // 关闭发送端
 
-    while let Some(decrypted_data) = rx.recv().await {
-        ffmpeg_stdin.write_all(&decrypted_data).await?;
+    // 主线程按顺序写入 ffmpeg
+    let mut next_idx = 0;
+    while next_idx < total_segments {
+        // 等待通知
+        if let Some(_received_idx) = notify_rx.recv().await {
+            let mut segments_lock = segments.lock().await;
+            // 检查是否有下一个需要的片段
+            while let Some(data) = segments_lock.remove(&next_idx) {
+                // 写入 ffmpeg
+                ffmpeg_stdin.write_all(&data).await?;
+                info!("Wr {} in ffmpeg", next_idx);
+                next_idx += 1;
+            }
+            drop(segments_lock);
+        } else {
+            break; // 所有发送者都已关闭
+        }
     }
 
     ffmpeg_stdin.shutdown().await?;
     let ffmpeg_status = ffmpeg.wait().await?;
     if ffmpeg_status.success() {
-        info!("FFmpeg process completed successfully");
+        info!("FFmpeg finish");
     } else {
-        error!("FFmpeg process encountered an error.");
+        error!("FFmpeg process error");
     }
 
-    info!("Total processing completed.");
+    info!("Done!");
     Ok(())
 }
