@@ -1,6 +1,6 @@
 use env_logger::Builder;
 use log::{info, error, LevelFilter};
-use tokio::sync::{mpsc, Semaphore, Mutex};
+use tokio::sync::{mpsc, Semaphore, RwLock};
 use tokio::process::Command;
 use tokio::io::AsyncWriteExt;
 use reqwest::Client;
@@ -16,12 +16,13 @@ use std::collections::HashMap;
 
 mod decryptor;
 
+
 const MAX_CONCURRENT_DOWNLOADS: usize = 8;
 
 async fn download_with_retry(client: &Client, url: &str, retries: u8) -> Result<Vec<u8>> {
     let mut attempt = 0;
     while attempt <= retries {
-        match client.get(url).timeout(Duration::from_secs(40)).send().await {
+        match client.get(url).timeout(Duration::from_secs(30)).send().await {
             Ok(response) if response.status().is_success() => {
                 return Ok(response.bytes().await?.to_vec());
             }
@@ -42,6 +43,69 @@ async fn download_with_retry(client: &Client, url: &str, retries: u8) -> Result<
         }
     }
     Err(anyhow::anyhow!("Failed to download segment from {} after {} retries", url, retries))
+}
+
+/// 将 JPEG 图像转换为 TS 格式
+async fn convert_jpeg_to_ts(input_path: &str, output_path: &str, duration: u32) -> Result<()> {
+    Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-loop").arg("1")
+        .arg("-i").arg(input_path)
+        .arg("-t").arg(duration.to_string()) // 设置每张图片的持续时间
+        .arg("-c:v").arg("libx264")
+        .arg("-pix_fmt").arg("yuv420p")
+        .arg("-f").arg("mpegts")
+        .arg(output_path)
+        .output()
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("Failed to convert JPEG to TS: {:?}", e))
+}
+
+/// 下载并处理片段（支持 TS 和 JPEG 转换）
+async fn download_and_process_segment(client: Arc<Client>, url: String, idx: usize, 
+    aes_key: Option<Vec<u8>>, aes_iv: Option<Vec<u8>>, 
+    segments: Arc<RwLock<HashMap<usize, Vec<u8>>>>, 
+    notify_tx: mpsc::Sender<usize>) -> Result<()> {
+let is_jpeg = url.ends_with(".jpeg");
+
+// 下载文件
+let data = download_with_retry(&client, &url, 10).await?;
+
+// 如果是 JPEG 文件，先保存为本地文件，再转换为 TS 格式
+let processed_data = if is_jpeg {
+let jpeg_path = format!("segment_{}.jpeg", idx);
+let ts_path = format!("segment_{}.ts", idx);
+
+tokio::fs::write(&jpeg_path, &data).await?;  // 保存 JPEG 文件
+convert_jpeg_to_ts(&jpeg_path, &ts_path, 4).await?;  // 转换为 TS 格式
+
+// 读取转换后的 TS 文件数据
+tokio::fs::read(&ts_path).await?
+} else {
+data
+};
+
+// 解密 TS 数据（如果需要）
+let decrypted_data = if let (Some(aes_key), Some(aes_iv)) = (&aes_key, &aes_iv) {
+match decryptor::decrypt_segment(&processed_data, aes_key, aes_iv) {
+Ok(decrypted_data) => decrypted_data,
+Err(e) => {
+error!("解密片段 {} 失败: {:?}", idx, e);
+processed_data
+}
+}
+} else {
+processed_data
+};
+
+// 保存到共享 HashMap 中
+let mut segments_lock = segments.write().await;
+segments_lock.insert(idx, decrypted_data);
+drop(segments_lock);
+
+notify_tx.send(idx).await.unwrap();
+Ok(())
 }
 
 pub async fn parse_m3u8(m3u8_url: &str, client: &Client) -> Result<(Vec<String>, Option<Vec<u8>>, Option<Vec<u8>>)> {
@@ -111,12 +175,12 @@ async fn main() -> Result<()> {
         .init();
 
     let client = Arc::new(Client::new());
-    let m3u8_url = "https://anbgvvgzhm88.cdn-jupiter.com/hls2/01/01453/k9n8zgx639mm_n/index-v1-a1.m3u8?t=24D9mmZ80ihPtypK59IC_wLC6kQhbKaG3AA6JJgrsIk&s=1730731634&e=129600&f=7268461&srv=Gs5UDtPpa5&i=0.4&sp=500&p1=Gs5UDtPpa5&p2=Gs5UDtPpa5&asn=20473";
+    let m3u8_url = "https://g6las13cmjku.cdn-jupiter.com/hls2/01/02113/phh0hnk6fug5_n/index-v1-a1.m3u8?t=IPcZs08tCrOq7u4-REGVWZS_-Iu4-uiPsZ1p0ZFoB6M&s=1730730882&e=129600&f=10569821&srv=vr4pcjm18sa1&i=0.4&sp=500&p1=vr4pcjm18sa1&p2=vr4pcjm18sa1&asn=20473";
     let (ts_urls, aes_key, aes_iv) = parse_m3u8(m3u8_url, &client).await?;
     info!("解析 M3U8 文件并获取了 AES 密钥和 IV（如果缺失则使用默认 IV）");
 
     let total_segments = ts_urls.len();
-    let segments = Arc::new(Mutex::new(HashMap::<usize, Vec<u8>>::new()));
+    let segments = Arc::new(RwLock::new(HashMap::<usize, Vec<u8>>::new()));
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
 
     let mut ffmpeg = start_ffmpeg().await?;
@@ -134,67 +198,37 @@ async fn main() -> Result<()> {
 
         tokio::spawn(async move {
             let _permit = semaphore.acquire().await.unwrap();
-
-            match download_with_retry(&client, &url, 10).await {
-                Ok(data) => {
-                    // 解密数据
-                    let decrypted_data = if let (Some(aes_key), Some(aes_iv)) = (&aes_key, &aes_iv) {
-                        match decryptor::decrypt_segment(&data, aes_key, aes_iv) {
-                            Ok(decrypted_data) => {
-                                info!("解密片段 {} 成功", idx);
-                                decrypted_data
-                            }
-                            Err(e) => {
-                                error!("解密片段 {} 失败: {:?}", idx, e);
-                                data
-                            }
-                        }
-                    } else {
-                        data
-                    };
-
-                    // 将解密后的数据存储到共享的 HashMap 中
-                    let mut segments_lock = segments.lock().await;
-                    segments_lock.insert(idx, decrypted_data);
-                    drop(segments_lock);
-
-                    // 通知主线程该片段已处理完成
-                    notify_tx.send(idx).await.unwrap();
-                }
-                Err(e) => error!("Download {} Failed: {:?}", idx, e),
+            if let Err(e) = download_and_process_segment(client, url, idx, aes_key, aes_iv, segments, notify_tx).await {
+                error!("Failed to process segment {}: {:?}", idx, e);
             }
         });
     }
 
-    drop(notify_tx); // 关闭发送端
+    drop(notify_tx);
 
-    // 主线程按顺序写入 ffmpeg
     let mut next_idx = 0;
     while next_idx < total_segments {
-        // 等待通知
         if let Some(_received_idx) = notify_rx.recv().await {
-            let mut segments_lock = segments.lock().await;
-            // 检查是否有下一个需要的片段
+            let mut segments_lock = segments.write().await;
             while let Some(data) = segments_lock.remove(&next_idx) {
-                // 写入 ffmpeg
                 ffmpeg_stdin.write_all(&data).await?;
-                info!("Wr {} in ffmpeg", next_idx);
+                info!("写入片段 {} 到 FFmpeg", next_idx);
                 next_idx += 1;
             }
             drop(segments_lock);
         } else {
-            break; // 所有发送者都已关闭
+            break;
         }
     }
 
     ffmpeg_stdin.shutdown().await?;
     let ffmpeg_status = ffmpeg.wait().await?;
     if ffmpeg_status.success() {
-        info!("FFmpeg finish");
+        info!("FFmpeg 处理完成");
     } else {
-        error!("FFmpeg process error");
+        error!("FFmpeg 进程处理失败");
     }
 
-    info!("Done!");
+    info!("任务完成！");
     Ok(())
 }

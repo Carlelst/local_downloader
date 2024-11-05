@@ -3,6 +3,10 @@ name = "video_processor"
 version = "0.1.0"
 edition = "2018"
 
+[lib]
+name = "video_processor"   
+path = "./src/lib.rs"        
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.11", features = ["json", "stream"] }
@@ -16,3 +20,6 @@ block-modes = "0.8"
 chrono = "0.4"
 futures = "0.3"
 rand = "0.8"
+criterion = "0.3"
+tokio-test = "0.4"
+url = "2.2"
