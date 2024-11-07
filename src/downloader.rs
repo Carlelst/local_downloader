@@ -1,29 +1,30 @@
 use reqwest::Client;
-use tokio::time::sleep;
-use log::{error, info};
-use std::time::Duration;
+use tokio::time::{sleep, Duration};
 use anyhow::Result;
+use log::{error, warn};
+use bytes::Bytes;
 
-/// 使用重试机制下载数据
-pub async fn download_with_retry(client: &Client, url: &str, retries: u8) -> Result<Vec<u8>> {
-    let mut attempt = 0;
-    while attempt <= retries {
-        match client.get(url).timeout(Duration::from_secs(40)).send().await {
+/// 通用的下载函数，增加详细日志和错误信息
+pub async fn download_with_retry(client: &Client, url: &str, retries: u8, timeout: u64, retry_interval: u64) -> Result<Bytes> {
+    for attempt in 0..=retries {
+        // info!("Attempt {}: Downloading from {}", attempt + 1, url);
+        match client.get(url).timeout(Duration::from_secs(timeout)).send().await {
             Ok(response) if response.status().is_success() => {
-                return Ok(response.bytes().await?.to_vec());
-            }
+                // info!("Download successful for {}", url);
+                return Ok(response.bytes().await?);
+            },
             Ok(response) => {
-                error!("Failed to download segment {}: HTTP {}", url, response.status());
-            }
+                warn!("HTTP {} when downloading {}: Retrying...", response.status(), url);
+            },
             Err(e) => {
-                error!("Error downloading segment {}: {:?}", url, e);
+                error!("Error on attempt {} for {}: {:?}", attempt + 1, url, e);
             }
         }
-        attempt += 1;
-        if attempt <= retries {
-            info!("Retrying download for {} (attempt {}/{})", url, attempt, retries);
-            sleep(Duration::from_secs(3)).await;
+        if attempt < retries {
+            sleep(Duration::from_secs(retry_interval)).await;
         }
     }
-    Err(anyhow::anyhow!("Failed to download segment from {} after {} retries", url, retries))
+    Err(anyhow::anyhow!("Failed to download from {} after {} attempts", url, retries))
 }
+
+

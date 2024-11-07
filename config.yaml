@@ -1,0 +1,22 @@
+#m3u8_url: "https://hls-uranus.sb-cd.com/hls/1/3/13048167-720p.mp4/iframes-v1-a1.m3u8?_tid=13048167&d=1&m=48&secure=T7XeDtaoIayHB_qNUOkCUg,1730435969"
+#m3u8_url: "https://cdn1.turboviplay.com/data2/671f2d7b00710/671f2d7b00710.m3u8"
+#m3u8_url: https://cdn1.turboviplay.com/data1/6728370e97f68/6728370e97f68.m3u8
+#m3u8_url: https://g28.turbosplayer.com/video/f6371067-427a-4f62-9b24-7513f33cc7cc/master.m3u8
+# m3u8_url: https://g28.turbosplayer.com/video/47083a4c-368b-4d4e-981f-c68422655783/master.m3u8
+# m3u8_url: https://cdn1.turboviplay.com/data1/67162d74f3e05/67162d74f3e05.m3u8
+#m3u8_url: https://javday.online/videos/639b5018370c97f5a4630283/15gdg8/index.m3u8?line=640b661872d260c5fa56ee38
+#m3u8_url: https://surrit.com/387c2537-91f8-4365-b4a7-ddc63552c238/720p/video.m3u8
+#m3u8_url: https://surrit.com/4d9ad831-aa64-43d3-a118-239380884d7e/720p/video.m3u8
+#m3u8_url: https://surrit.com/6f9e6486-4445-4bee-8e59-db94f2e37364/720p/video.m3u8
+#m3u8_url: https://surrit.com/01f924a8-d9b4-4be5-92be-d4b81036513e/1280x720/video.m3u8
+#m3u8_url: https://surrit.com/62268eed-34de-4f17-8acc-7fda45585cd3/1280x720/video.m3u8
+# m3u8_url: https://surrit.com/8ffc7c34-4712-48ab-9fee-66d8b148f33e/720p/video.m3u8
+# m3u8_url: https://javday.online/videos/63503029c96db0f53bf47c94/dag44f/index.m3u8?line=640b661872d260c5fa56ee38
+#m3u8_url:https://cdn1.turboviplay.com/data1/670f2a89836e8/670f2a89836e81080.m3u8
+#m3u8_url:https://cdn1.turboviplay.com/data1/6700bb6e49eac/6700bb6e49eac1080.m3u8
+#https://cdn1.turboviplay.com/data2/6727709b32800/6727709b32800.m3u8
+m3u8_url: https://g22.turbosplayer.com/video/3aa7e6ac-aaf8-458f-b534-cf16cfe2c7ea/master.m3u8
+max_concurrent_downloads: 8  #下载并行数
+download_retries: 5  # 下载重试数
+segment_timeout: 40  # 每个片段下载的超时时间，单位：秒
+retry_interval: 3    # 重试间隔时间，单位：秒

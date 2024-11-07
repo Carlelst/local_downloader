@@ -4,23 +4,42 @@ version = "0.1.0"
 edition = "2018"
 
 [lib]
-name = "video_processor"   
-path = "./src/lib.rs"        
+name = "video_processor"
+path = "./src/lib.rs"
 
 [dependencies]
+# Asynchronous runtime and concurrency
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.11", features = ["json", "stream"] }
-regex = "1"
+
+# HTTP client
+reqwest = { version = "0.11", features = ["json", "stream", "gzip"] }
+
+# Utilities
+regex = "1.5"
 hex = "0.4"
 log = "0.4"
-env_logger = "0.9"
+env_logger = "0.10"
 anyhow = "1.0"
-aes = "0.7"
-block-modes = "0.8"
 chrono = "0.4"
-futures = "0.3"
-rand = "0.8"
-criterion = "0.3"
-tokio-test = "0.4"
 url = "2.2"
 bytes = "1.0"
+
+# Cryptography
+aes = "0.7"
+block-modes = "0.8"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+
+# Random number generation
+rand = "0.8"
+
+[dev-dependencies]
+# Benchmarking and testing
+criterion = "0.3"
+tokio-test = "0.4"
+mockito = "0.31.0"
+
+[futures]
+optional = true
