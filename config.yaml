@@ -12,11 +12,26 @@
 #m3u8_url: https://surrit.com/62268eed-34de-4f17-8acc-7fda45585cd3/1280x720/video.m3u8
 # m3u8_url: https://surrit.com/8ffc7c34-4712-48ab-9fee-66d8b148f33e/720p/video.m3u8
 # m3u8_url: https://javday.online/videos/63503029c96db0f53bf47c94/dag44f/index.m3u8?line=640b661872d260c5fa56ee38
-#m3u8_url:https://cdn1.turboviplay.com/data1/670f2a89836e8/670f2a89836e81080.m3u8
-#m3u8_url:https://cdn1.turboviplay.com/data1/6700bb6e49eac/6700bb6e49eac1080.m3u8
-#https://cdn1.turboviplay.com/data2/6727709b32800/6727709b32800.m3u8
-m3u8_url: https://g22.turbosplayer.com/video/3aa7e6ac-aaf8-458f-b534-cf16cfe2c7ea/master.m3u8
+# m3u8_url: https://cdn1.turboviplay.com/data1/6700bb6e49eac/6700bb6e49eac1080.m3u8
+#m3u8_url: https://cdn122.tupkho.com/data/B/4B/j60mflFOz5JKDkDMaFht3ZTBoPTRQZCvjJA/j60mflFOz5JKDkDMaFht3ZTBoPTRQZCvjJA1080.m3u8
+#m3u8_url: https://cdn86.supreny.com/data/F/F0/q3YHfbncHHuQCEOP6Zxhb3PMEjJG6rlhe04/q3YHfbncHHuQCEOP6Zxhb3PMEjJG6rlhe041080.m3u8
+#m3u8_url: https://cdn1.turboviplay.com/data1/QlNdrqyISXW0Xz6EHKPm/QlNdrqyISXW0Xz6EHKPm1080.m3u8
+#m3u8_url: https://cdn1.turboviplay.com/data1/668e0ce2e500e/668e0ce2e500e1080.m3u8
+#m3u8_url: https://cdn1.turboviplay.com/data1/66ea4cfd33a90/66ea4cfd33a901080.m3u8
+#m3u8_url: https://cdn1.turboviplay.com/data2/66fa222633f79/66fa222633f79.m3u8
+#m3u8_url: https://cdn1.turboviplay.com/data1/6708cca74fc64/6708cca74fc641080.m3u8
+# m3u8_url: https://cdn1.turboviplay.com/data1/6705e1e91ce20/6705e1e91ce201080.m3u8
+
+# m3u8_url: https://cdn1.turboviplay.com/data2/iibwa3mZ9nYc3n3mLxXm/iibwa3mZ9nYc3n3mLxXm.m3u8
+#m3u8_url: https://cdn54.valybay.com/data/D/F2/Iuf8GCcqZxwWHYJz1CUb8kEbOVAOt45SAGj/Iuf8GCcqZxwWHYJz1CUb8kEbOVAOt45SAGj480.m3u8
+# m3u8_url: https://cdn54.valybay.com/data/B/60/up3cntKMSIbRsRm2QZ4SzwldPV1EHd6NGjZ/up3cntKMSIbRsRm2QZ4SzwldPV1EHd6NGjZ480.m3u8
+# m3u8_url: https://cdn1.turboviplay.com/data2/51gpJKBHQmrNCK9iz5O5/51gpJKBHQmrNCK9iz5O5.m3u8
+# m3u8_url: https://cdn1.turboviplay.com/data2/6eKi6HZhDCDVl0waEZTR/6eKi6HZhDCDVl0waEZTR.m3u8
+# m3u8_url: https://cdn87.chillnany.com/data/D/ED/D8fbOwMKFapbxafY51gFUs6plzDAMXISxtS/D8fbOwMKFapbxafY51gFUs6plzDAMXISxtS1080.m3u8
+m3u8_url: https://s100-e1.uutestf.com/ppot/_definst_/mp4:s100/hvod_news/XW-A9D808781-73175.mp4/chunklist.m3u8?vendtime=1731348324&vhash=84KqQAZH9x2ThcXt9Ay2ipgOKOgwNCJ2K1323PHgPcs=&vCustomParameter=0_45.76.178.142.SG_0&lb=ad6d3651ddcebf259dd2dd14dea22f30&proxy=Sp4mC2rbCIvrTNHbStHcBcDlRNnpCJ0mBMKnBdLrT6LpT6SkOsyslZcOc1WMifYNEhgwChcwD1SnjxD
 max_concurrent_downloads: 8  #下载并行数
 download_retries: 5  # 下载重试数
 segment_timeout: 40  # 每个片段下载的超时时间，单位：秒
 retry_interval: 3    # 重试间隔时间，单位：秒
+log_level: "debug"
+output_directory: "."

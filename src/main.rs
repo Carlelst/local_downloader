@@ -12,6 +12,7 @@ use std::io::Write;
 use serde::Deserialize;
 use serde_yaml::from_reader;
 use std::fs::File;
+use anyhow::Context;
 
 use video_processor::m3u8_parser::parse_m3u8;
 use video_processor::ffmpeg::start_ffmpeg;
@@ -30,22 +31,12 @@ struct Config {
 
 // 加载 YAML 配置文件
 fn load_config() -> Result<Config> {
-    let file = File::open("config.yaml")?;
-    let config: Config = from_reader(file)?;
+    let file = File::open("config.yaml").context("Failed to open config file")?;
+    let config: Config = from_reader(file).context("Failed to parse config file")?;
     Ok(config)
 }
 
-/// 下载文件并存为 .ts 格式
-// async fn download_file_as_ts(client: &Client, url: &str, idx: usize, output_dir: &str) -> Result<String> {
-//     let response = client.get(url).send().await?;
-//     let file_bytes = response.bytes().await?;
-
-//     fs::create_dir_all(output_dir)?;
-//     let ts_path = format!("{}/segment_{}.ts", output_dir, idx);
-//     fs::write(&ts_path, &file_bytes)?;
-//     Ok(ts_path)
-// }
-
+/// 处理单个段的下载和解密
 async fn process_segment(
     client: Arc<Client>, 
     url: String, 

@@ -22,8 +22,4 @@ project_root/
 │   ├── m3u8_parser.rs            # M3U8 解析逻辑
 │   ├── ffmpeg.rs                 # FFmpeg 相关逻辑
 │   └── tests/
-│       ├── integration_tests.rs  # 集成测试文件
-│       ├── downloader_tests.rs   # 下载模块测试
-│       └── m3u8_parser_tests.rs  # M3U8 解析模块测试
-└── benches/
-    ├── benchmarks.rs             # 基准测试文件
+
