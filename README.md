@@ -22,4 +22,8 @@ project_root/
 │   ├── m3u8_parser.rs            # M3U8 解析逻辑
 │   ├── ffmpeg.rs                 # FFmpeg 相关逻辑
 │   └── tests/
+```
 
+## Support
+- https://surrit.com/xxx/video.m3u8
+- 

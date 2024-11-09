@@ -7,9 +7,7 @@
 #m3u8_url: https://javday.online/videos/639b5018370c97f5a4630283/15gdg8/index.m3u8?line=640b661872d260c5fa56ee38
 #m3u8_url: https://surrit.com/387c2537-91f8-4365-b4a7-ddc63552c238/720p/video.m3u8
 #m3u8_url: https://surrit.com/4d9ad831-aa64-43d3-a118-239380884d7e/720p/video.m3u8
-#m3u8_url: https://surrit.com/6f9e6486-4445-4bee-8e59-db94f2e37364/720p/video.m3u8
-#m3u8_url: https://surrit.com/01f924a8-d9b4-4be5-92be-d4b81036513e/1280x720/video.m3u8
-#m3u8_url: https://surrit.com/62268eed-34de-4f17-8acc-7fda45585cd3/1280x720/video.m3u8
+m3u8_url: https://surrit.com/6f9e6486-4445-4bee-8e59-db94f2e37364/720p/video.m3u8
 # m3u8_url: https://surrit.com/8ffc7c34-4712-48ab-9fee-66d8b148f33e/720p/video.m3u8
 # m3u8_url: https://javday.online/videos/63503029c96db0f53bf47c94/dag44f/index.m3u8?line=640b661872d260c5fa56ee38
 # m3u8_url: https://cdn1.turboviplay.com/data1/6700bb6e49eac/6700bb6e49eac1080.m3u8
@@ -28,7 +26,6 @@
 # m3u8_url: https://cdn1.turboviplay.com/data2/51gpJKBHQmrNCK9iz5O5/51gpJKBHQmrNCK9iz5O5.m3u8
 # m3u8_url: https://cdn1.turboviplay.com/data2/6eKi6HZhDCDVl0waEZTR/6eKi6HZhDCDVl0waEZTR.m3u8
 # m3u8_url: https://cdn87.chillnany.com/data/D/ED/D8fbOwMKFapbxafY51gFUs6plzDAMXISxtS/D8fbOwMKFapbxafY51gFUs6plzDAMXISxtS1080.m3u8
-m3u8_url: https://s100-e1.uutestf.com/ppot/_definst_/mp4:s100/hvod_news/XW-A9D808781-73175.mp4/chunklist.m3u8?vendtime=1731348324&vhash=84KqQAZH9x2ThcXt9Ay2ipgOKOgwNCJ2K1323PHgPcs=&vCustomParameter=0_45.76.178.142.SG_0&lb=ad6d3651ddcebf259dd2dd14dea22f30&proxy=Sp4mC2rbCIvrTNHbStHcBcDlRNnpCJ0mBMKnBdLrT6LpT6SkOsyslZcOc1WMifYNEhgwChcwD1SnjxD
 max_concurrent_downloads: 8  #下载并行数
 download_retries: 5  # 下载重试数
 segment_timeout: 40  # 每个片段下载的超时时间，单位：秒

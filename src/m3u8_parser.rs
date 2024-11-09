@@ -45,8 +45,11 @@ fn transform_line_to_url(line: &str, base_url: &Url) -> String {
         return base_url.join(line).map(|url| url.to_string()).unwrap_or_else(|_| line.to_string());
     }
     if line.ends_with(".jpeg") {
-        let modified_line = format!("{}.ts", line.trim_end_matches(".jpeg"));
-        return base_url.join(&modified_line).map(|url| url.to_string()).unwrap_or_else(|_| modified_line);
+        return base_url
+            .join(&format!("{}", line))
+            .map(|url| url.to_string())
+            .unwrap_or_else(|_| line.to_string());
     }
     line.to_string()
 }
+
