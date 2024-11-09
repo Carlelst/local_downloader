@@ -14,14 +14,23 @@
 ```plaintext
 project_root/
 ├── Cargo.toml                    # 项目配置和依赖项
+├── Dockerfile                    # 容器配置文件
+├── docker-compose.yml            # 容器编排配置
+├── config.yaml                   # 应用程序配置文件
 ├── src/
 │   ├── main.rs                   # 主程序入口
-│   ├── lib.rs                    # 公共模块定义
+│   ├── lib.rs                    # 公共模块定义和导入
 │   ├── decryptor.rs              # 解密逻辑模块
-│   ├── downloader.rs             # 下载和重试逻辑
-│   ├── m3u8_parser.rs            # M3U8 解析逻辑
-│   ├── ffmpeg.rs                 # FFmpeg 相关逻辑
-│   └── tests/
+│   ├── downloader.rs             # 下载和重试逻辑模块
+│   ├── m3u8_parser.rs            # M3U8 解析逻辑模块
+│   ├── ffmpeg.rs                 # FFmpeg 相关逻辑模块
+│   ├── utils.rs                  # 实用工具和辅助函数模块
+└── tests/
+    ├── integration_test.rs       # 集成测试
+    ├── downloader_test.rs        # 下载模块的单元测试
+    ├── m3u8_parser_test.rs       # M3U8 解析模块的单元测试
+    └── ffmpeg_test.rs            # FFmpeg 相关逻辑的单元测试
+
 ```
 
 ## Support

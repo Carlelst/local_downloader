@@ -31,8 +31,8 @@ struct Config {
 
 // 加载 YAML 配置文件
 fn load_config() -> Result<Config> {
-    let file = File::open("config.yaml").context("Failed to open config file")?;
-    let config: Config = from_reader(file).context("Failed to parse config file")?;
+    let file = File::open("config.yaml").context("无法打开配置文件")?;
+    let config: Config = from_reader(file).context("解析配置文件失败")?;
     Ok(config)
 }
 
@@ -53,7 +53,7 @@ async fn process_segment(
     let processed_data = data.to_vec();
     let decrypted_data = if let (Some(key), Some(iv)) = (&aes_key, &aes_iv) {
         decryptor::decrypt_segment(&processed_data, key, iv).unwrap_or_else(|e| {
-            error!("Decryption failed for segment {}: {:?}", idx, e);
+            error!("解密失败，段 {}: {:?}", idx, e);
             processed_data.clone()
         })
     } else {
@@ -75,7 +75,7 @@ async fn main() -> Result<()> {
     let start_time = Instant::now(); // 记录程序开始时间
 
     let config = load_config()?;
-    info!("Loaded configuration: {:?}", config);
+    info!("加载配置: {:?}", config);
 
     let client = Arc::new(Client::new());
     let (ts_urls, aes_key, aes_iv) = parse_m3u8(&config.m3u8_url, &client).await?;
@@ -84,7 +84,7 @@ async fn main() -> Result<()> {
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent_downloads));
     let (notify_tx, mut notify_rx) = mpsc::channel(total_segments);
     let mut ffmpeg = start_ffmpeg().await?;
-    let ffmpeg_stdin = ffmpeg.stdin.as_mut().ok_or_else(|| anyhow::anyhow!("Unable to open FFmpeg stdin"))?;
+    let ffmpeg_stdin = ffmpeg.stdin.as_mut().ok_or_else(|| anyhow::anyhow!("无法打开 FFmpeg 标准输入"))?;
 
     for (idx, url) in ts_urls.into_iter().enumerate() {
         let client = Arc::clone(&client);
@@ -100,7 +100,7 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             let _permit = semaphore.acquire().await;
             if let Err(e) = process_segment(client, url, idx, aes_key, aes_iv, segments, notify_tx, timeout, retries, retry_interval).await {
-                error!("Segment processing failed for segment {}: {:?}", idx, e);
+                error!("段处理失败，段 {}: {:?}", idx, e);
             }
         });
     }
@@ -117,11 +117,11 @@ async fn main() -> Result<()> {
 
     ffmpeg_stdin.shutdown().await?;
     if ffmpeg.wait().await?.success() {
-        info!("FFmpeg processing completed successfully");
+        info!("FFmpeg 处理成功");
     } else {
-        error!("FFmpeg processing failed");
+        error!("FFmpeg 处理失败");
     }
 
-    info!("Total Time: {:.2?}", start_time.elapsed());
+    info!("总耗时: {:.2?}", start_time.elapsed());
     Ok(())
 }
