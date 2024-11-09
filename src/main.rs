@@ -9,64 +9,16 @@ use chrono::Local;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::io::Write;
-use serde::Deserialize;
-use serde_yaml::from_reader;
-use std::fs::File;
-use anyhow::Context;
 
-use video_processor::m3u8_parser::parse_m3u8;
-use video_processor::ffmpeg::start_ffmpeg;
-use video_processor::downloader::download_with_retry;
-
-mod decryptor;
-
-#[derive(Debug, Deserialize)]
-struct Config {
-    m3u8_url: String,
-    max_concurrent_downloads: usize,
-    download_retries: u8,
-    segment_timeout: u64,
-    retry_interval: u64,
-}
-
-// 加载 YAML 配置文件
-fn load_config() -> Result<Config> {
-    let file = File::open("config.yaml").context("无法打开配置文件")?;
-    let config: Config = from_reader(file).context("解析配置文件失败")?;
-    Ok(config)
-}
-
-/// 处理单个段的下载和解密
-async fn process_segment(
-    client: Arc<Client>, 
-    url: String, 
-    idx: usize, 
-    aes_key: Option<Vec<u8>>, 
-    aes_iv: Option<Vec<u8>>,
-    segments: Arc<RwLock<HashMap<usize, Vec<u8>>>>, 
-    notify_tx: mpsc::Sender<usize>,
-    timeout: u64, 
-    retries: u8, 
-    retry_interval: u64
-) -> Result<()> {
-    let data = download_with_retry(&client, &url, retries, timeout, retry_interval).await?;
-    let processed_data = data.to_vec();
-    let decrypted_data = if let (Some(key), Some(iv)) = (&aes_key, &aes_iv) {
-        decryptor::decrypt_segment(&processed_data, key, iv).unwrap_or_else(|e| {
-            error!("解密失败，段 {}: {:?}", idx, e);
-            processed_data.clone()
-        })
-    } else {
-        processed_data
-    };
-
-    segments.write().await.insert(idx, decrypted_data);
-    notify_tx.send(idx).await.ok();
-    Ok(())
-}
+use video_processor::{
+    m3u8_parser::parse_m3u8,
+    ffmpeg::start_ffmpeg,
+    segment_processor::process_segment,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 初始化日志
     Builder::new()
         .filter(None, LevelFilter::Info)
         .format(|buf, record| writeln!(buf, "[{} {}] {}", Local::now().format("%Y-%m-%d %H:%M:%S"), record.level(), record.args()))
@@ -74,13 +26,14 @@ async fn main() -> Result<()> {
 
     let start_time = Instant::now(); // 记录程序开始时间
 
-    let config = load_config()?;
+    // 加载配置
+    let config = video_processor::load_config()?;
     info!("加载配置: {:?}", config);
 
     let client = Arc::new(Client::new());
     let (ts_urls, aes_key, aes_iv) = parse_m3u8(&config.m3u8_url, &client).await?;
     let total_segments = ts_urls.len();
-    let segments = Arc::new(RwLock::new(HashMap::with_capacity(total_segments)));
+    let segments = Arc::new(RwLock::new(HashMap::<usize, Vec<u8>>::with_capacity(total_segments)));
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent_downloads));
     let (notify_tx, mut notify_rx) = mpsc::channel(total_segments);
     let mut ffmpeg = start_ffmpeg().await?;
