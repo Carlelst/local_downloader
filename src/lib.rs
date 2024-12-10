@@ -24,7 +24,7 @@ use std::fs::File;
 /// 配置结构体定义，用于加载 YAML 配置文件
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    pub m3u8_url: String,
+    pub m3u8_urls: Vec<String>,
     pub max_concurrent_downloads: usize,
     pub download_retries: u8,
     pub segment_timeout: u64,
