@@ -42,6 +42,8 @@ pub struct Config {
     pub audio_codec: String,
     #[serde(default = "default_buffer_size")]
     pub buffer_size: usize,
+    #[serde(default = "default_validate_segments")]
+    pub validate_segments: bool,
 }
 
 fn default_output_directory() -> String {
@@ -66,6 +68,10 @@ fn default_audio_codec() -> String {
 
 fn default_buffer_size() -> usize {
     1024 * 1024 * 4 // 默认缓冲区大小为4MB
+}
+
+fn default_validate_segments() -> bool {
+    false // 默认不验证片段可访问性
 }
 
 /// 加载 YAML 配置文件并解析

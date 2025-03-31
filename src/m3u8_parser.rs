@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use log::{debug, error, info, warn};
 use regex::Regex;
 use reqwest::Client;
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -66,6 +67,7 @@ fn parse_m3u8_with_depth<'a>(
         }
 
         info!("M3U8 内容长度: {} 字节", m3u8_content.len());
+        debug!("M3U8 内容: {}", m3u8_content);
 
         // 解析基础 URL，用于构建相对路径
         let base_url = match Url::parse(m3u8_url) {
@@ -85,10 +87,11 @@ fn parse_m3u8_with_depth<'a>(
         debug!("M3U8 基础 URL: {}", base_url);
 
         // 先检查是否是主播放列表（包含其他 m3u8）
-        let master_playlist_re = Regex::new(r#"#EXT-X-STREAM-INF:.*?\n(.*?\.m3u8)"#)?;
+        // 正则表达式模式匹配EXT-X-STREAM-INF行和下一行的m3u8链接
+        let master_playlist_re = Regex::new(r#"#EXT-X-STREAM-INF:.*?\n(.*?\.m3u8.*?)\n"#)?;
         if let Some(captures) = master_playlist_re.captures(&m3u8_content) {
             if let Some(sub_m3u8_path) = captures.get(1) {
-                let sub_path = sub_m3u8_path.as_str();
+                let sub_path = sub_m3u8_path.as_str().trim();
                 let sub_url = if sub_path.starts_with("http") {
                     sub_path.to_string()
                 } else {
@@ -114,17 +117,50 @@ async fn process_media_playlist(
     client: &Client,
 ) -> Result<(Vec<String>, Option<Vec<u8>>, Option<Vec<u8>>)> {
     // 提取所有 .ts 片段
-    let mut ts_urls: Vec<String> = m3u8_content
-        .lines()
-        .filter(|line| !line.starts_with('#') && !line.is_empty())
-        .map(|line| transform_line_to_url(line, base_url))
-        .collect();
+    let mut ts_urls = Vec::new();
+    let mut processed_urls = HashSet::new(); // 用于去重
+    let lines: Vec<&str> = m3u8_content.lines().collect();
+
+    for (i, line) in lines.iter().enumerate() {
+        let line = line.trim();
+
+        // 如果是EXTINF行，下一行通常是片段URL
+        if line.starts_with("#EXTINF:") && i + 1 < lines.len() {
+            let next_line = lines[i + 1].trim();
+            if !next_line.starts_with('#') && !next_line.is_empty() {
+                if next_line.contains(".ts")
+                    || next_line.contains(".m4s")
+                    || next_line.contains(".mp4")
+                {
+                    let ts_url = transform_line_to_url(next_line, base_url);
+                    if !ts_url.is_empty() && !processed_urls.contains(&ts_url) {
+                        processed_urls.insert(ts_url.clone());
+                        ts_urls.push(ts_url);
+                    }
+                }
+            }
+        } else if !line.starts_with('#') && !line.is_empty() {
+            // 直接是片段URL的情况
+            if line.contains(".ts") || line.contains(".m4s") || line.contains(".mp4") {
+                let ts_url = transform_line_to_url(line, base_url);
+                if !ts_url.is_empty() && !processed_urls.contains(&ts_url) {
+                    processed_urls.insert(ts_url.clone());
+                    ts_urls.push(ts_url);
+                }
+            }
+        }
+    }
 
     // 清理无效 URLs
     ts_urls.retain(|url| !url.trim().is_empty());
 
+    // 仅保留唯一的URL
+    ts_urls.dedup();
+
     if ts_urls.is_empty() {
         warn!("未从 M3U8 内容中找到任何 TS 片段链接");
+    } else {
+        debug!("找到 {} 个唯一片段: {:?}", ts_urls.len(), ts_urls);
     }
 
     // 解析加密信息
@@ -261,8 +297,13 @@ fn transform_line_to_url(line: &str, base_url: &Url) -> String {
         return line.to_string();
     }
 
-    // 对于 .ts 或 .jpeg 文件使用 base_url
-    if line.contains(".ts") || line.ends_with(".jpeg") || line.ends_with(".jpg") {
+    // 对于视频片段文件使用 base_url
+    if line.contains(".ts")
+        || line.contains(".m4s")
+        || line.contains(".mp4")
+        || line.ends_with(".jpeg")
+        || line.ends_with(".jpg")
+    {
         return match base_url.join(line) {
             Ok(url) => url.to_string(),
             Err(e) => {

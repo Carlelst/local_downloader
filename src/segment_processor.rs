@@ -1,15 +1,14 @@
-use log::{error};
-use reqwest::Client;
-use tokio::sync::{mpsc, RwLock};
-use anyhow::Result;
-use std::sync::Arc;
-use std::collections::HashMap;
-use crate::downloader::download_with_retry;
 use crate::decryptor;
-
+use crate::downloader::download_with_retry;
+use anyhow::Result;
+use log::{debug, error};
+use reqwest::Client;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::{mpsc, RwLock};
 
 /// 处理单个段的下载和解密
-/// 
+///
 /// # 参数
 /// - `client`: HTTP 客户端实例
 /// - `url`: 段的 URL
@@ -21,33 +20,50 @@ use crate::decryptor;
 /// - `timeout`: 每次请求的超时时间（秒）
 /// - `retries`: 最大重试次数
 /// - `retry_interval`: 重试之间的间隔时间（秒）
-/// 
+///
 /// # 返回
-/// 返回一个 Result，表示处理是否成功
+/// 返回一个 Result，包含解密后的数据或错误
 pub async fn process_segment(
-    client: Arc<Client>, 
-    url: String, 
-    idx: usize, 
-    aes_key: Option<Vec<u8>>, 
-    aes_iv: Option<Vec<u8>>, 
-    segments: Arc<RwLock<HashMap<usize, Vec<u8>>>>, 
+    client: Arc<Client>,
+    url: String,
+    idx: usize,
+    aes_key: Option<Vec<u8>>,
+    aes_iv: Option<Vec<u8>>,
+    segments: Arc<RwLock<HashMap<usize, Vec<u8>>>>,
     notify_tx: mpsc::Sender<usize>,
-    timeout: u64, 
-    retries: u8, 
-    retry_interval: u64
-) -> Result<()> {
+    timeout: u64,
+    retries: u8,
+    retry_interval: u64,
+) -> Result<Vec<u8>> {
+    debug!("开始处理片段 {}: {}", idx, url);
     let data = download_with_retry(&client, &url, retries, timeout, retry_interval).await?;
     let processed_data = data.to_vec();
     let decrypted_data = if let (Some(key), Some(iv)) = (&aes_key, &aes_iv) {
-        decryptor::decrypt_segment(&processed_data, key, iv).unwrap_or_else(|e| {
-            error!("解密失败，段 {}: {:?}", idx, e);
-            processed_data.clone()
-        })
+        match decryptor::decrypt_segment(&processed_data, key, iv) {
+            Ok(data) => {
+                debug!("片段 {} 解密成功，大小: {} 字节", idx, data.len());
+                data
+            }
+            Err(e) => {
+                error!("解密失败，段 {}: {:?}", idx, e);
+                processed_data.clone()
+            }
+        }
     } else {
+        debug!(
+            "片段 {} 不需要解密，大小: {} 字节",
+            idx,
+            processed_data.len()
+        );
         processed_data
     };
 
-    segments.write().await.insert(idx, decrypted_data);
-    notify_tx.send(idx).await.ok();
-    Ok(())
+    // 将解密后的数据存入共享数据结构并通知
+    segments.write().await.insert(idx, decrypted_data.clone());
+    if let Err(e) = notify_tx.send(idx).await {
+        error!("无法发送通知，片段 {}: {:?}", idx, e);
+    }
+
+    // 返回解密后的数据，这样调用者可以保存到文件
+    Ok(decrypted_data)
 }

@@ -24,6 +24,7 @@ anyhow = "1.0"
 chrono = "0.4"
 url = "2.2"
 bytes = "1.0"
+md5 = "0.7"
 
 # 加密相关
 aes = "0.7"
@@ -32,6 +33,7 @@ block-modes = "0.8"
 # 序列化支持
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
+serde_json = "1.0"
 
 # 随机数生成器
 rand = "0.8"
