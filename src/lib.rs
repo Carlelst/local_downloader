@@ -44,6 +44,16 @@ pub struct Config {
     pub buffer_size: usize,
     #[serde(default = "default_validate_segments")]
     pub validate_segments: bool,
+    #[serde(default = "default_use_hw_accel")]
+    pub use_hw_accel: bool,
+    #[serde(default = "default_thread_count")]
+    pub thread_count: i32,
+    #[serde(default)]
+    pub video_bitrate: Option<String>,
+    #[serde(default)]
+    pub audio_bitrate: Option<String>,
+    #[serde(default = "default_chunk_size")]
+    pub chunk_size: usize,
 }
 
 fn default_output_directory() -> String {
@@ -72,6 +82,18 @@ fn default_buffer_size() -> usize {
 
 fn default_validate_segments() -> bool {
     false // 默认不验证片段可访问性
+}
+
+fn default_use_hw_accel() -> bool {
+    true // 默认启用硬件加速
+}
+
+fn default_thread_count() -> i32 {
+    0 // 自动选择线程数
+}
+
+fn default_chunk_size() -> usize {
+    1024 * 1024 // 默认1MB块大小
 }
 
 /// 加载 YAML 配置文件并解析

@@ -20,7 +20,7 @@ use video_processor::{
 #[tokio::main]
 async fn main() -> Result<()> {
     let start_time = Instant::now();
-    let config = video_processor::load_config()?;
+    let mut config = video_processor::load_config()?;
 
     // 初始化日志
     Builder::new()
@@ -39,6 +39,20 @@ async fn main() -> Result<()> {
     info!("加载配置: {:?}", config);
     info!("使用并发下载数: {}", config.max_concurrent_downloads);
 
+    // 增加自适应并发控制
+    let adaptive_concurrency = Arc::new(RwLock::new(config.max_concurrent_downloads));
+
+    // 动态调整缓冲区大小
+    let buffer_size = if config.buffer_size == 0 {
+        4 * 1024 * 1024 // 默认4MB
+    } else if config.buffer_size < 1024 * 1024 {
+        1024 * 1024 // 最小1MB
+    } else {
+        config.buffer_size
+    };
+
+    info!("使用缓冲区大小: {} 字节", buffer_size);
+
     // 检查是否需要清除缓存
     if std::env::args().any(|arg| arg == "--clear-cache") {
         info!("清除所有下载缓存...");
@@ -53,6 +67,24 @@ async fn main() -> Result<()> {
                 Ok(_) => info!("已创建新的缓存目录"),
                 Err(e) => warn!("创建缓存目录失败: {}", e),
             }
+        }
+    }
+
+    // 检查是否指定了比特率
+    for arg in std::env::args() {
+        if arg.starts_with("--bitrate=") {
+            let bitrate = arg.split('=').nth(1).unwrap_or("2M").to_string();
+            info!("使用命令行指定的视频比特率: {}", bitrate);
+            config.video_bitrate = Some(bitrate);
+        } else if arg == "--copy" {
+            // 强制使用copy模式
+            info!("使用copy模式，不重新编码视频");
+            config.video_codec = "copy".to_string();
+            config.use_hw_accel = false;
+        } else if arg == "--no-hw" {
+            // 禁用硬件加速
+            info!("禁用硬件加速");
+            config.use_hw_accel = false;
         }
     }
 
@@ -79,7 +111,7 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        info!(
+        debug!(
             "处理 M3U8 文件 [{}/{}]: {}",
             i + 1,
             config.m3u8_urls.len(),
@@ -96,7 +128,7 @@ async fn main() -> Result<()> {
         }
 
         // 解析M3U8获取片段链接和加密信息
-        info!("解析M3U8: {}", m3u8_url);
+        debug!("解析M3U8: {}", m3u8_url);
         let (ts_urls, aes_key, aes_iv) = parse_m3u8(m3u8_url, &client).await?;
         let total_segments = ts_urls.len();
 
@@ -206,6 +238,21 @@ async fn main() -> Result<()> {
         }
 
         // 只为需要下载的片段创建任务
+        let to_download_count = to_download.read().await.len();
+        let _downloads_per_batch = if to_download_count > 50 {
+            // 分批下载，避免一次创建过多任务
+            info!("分批下载 {} 个片段", to_download_count);
+            std::cmp::min(
+                30,                          // 每批最多30个
+                (to_download_count + 2) / 3, // 大约分3批
+            )
+        } else {
+            to_download_count
+        };
+
+        let download_status = Arc::new(RwLock::new(HashMap::<usize, (usize, Instant)>::new())); // 记录每个片段的下载状态和字节数
+        let bandwidth_monitor = Arc::new(RwLock::new(Vec::<f64>::with_capacity(10))); // 存储最近10次带宽测量
+
         for idx in to_download.read().await.iter().copied().collect::<Vec<_>>() {
             let url = ts_urls[idx].clone();
             let client = Arc::clone(&client);
@@ -220,13 +267,24 @@ async fn main() -> Result<()> {
             let segments_dir = segments_dir.clone();
             let downloaded = Arc::clone(&downloaded);
             let to_download = Arc::clone(&to_download);
+            let download_status_clone = Arc::clone(&download_status);
+            let adaptive_concurrency_clone = Arc::clone(&adaptive_concurrency);
+            let bandwidth_monitor_clone = Arc::clone(&bandwidth_monitor);
 
             // 启动下载任务
             let task = tokio::spawn(async move {
                 let _permit = semaphore.acquire().await.expect("获取信号量失败");
+                let start_time = Instant::now();
+
+                // 记录开始下载
+                {
+                    let mut status = download_status_clone.write().await;
+                    status.insert(idx, (0, start_time));
+                }
+
                 match process_segment(
                     client,
-                    url,
+                    url.clone(),
                     idx,
                     aes_key,
                     aes_iv,
@@ -247,7 +305,56 @@ async fn main() -> Result<()> {
                             } else {
                                 let mut downloaded_lock = downloaded.write().await;
                                 downloaded_lock.insert(idx);
-                                debug!("成功下载并保存片段 {}", idx);
+
+                                // 计算下载速度
+                                let elapsed = start_time.elapsed();
+                                let bytes = data.len();
+                                let mbps = if elapsed.as_millis() > 0 {
+                                    (bytes as f64 * 8.0) / (elapsed.as_millis() as f64) * 1000.0
+                                        / (1024.0 * 1024.0)
+                                } else {
+                                    0.0
+                                };
+
+                                // 记录带宽
+                                {
+                                    let mut bw = bandwidth_monitor_clone.write().await;
+                                    bw.push(mbps);
+                                    if bw.len() > 10 {
+                                        bw.remove(0);
+                                    }
+
+                                    // 动态调整并发数
+                                    if bw.len() >= 3 {
+                                        let avg_mbps: f64 =
+                                            bw.iter().sum::<f64>() / bw.len() as f64;
+                                        let mut concurrency =
+                                            adaptive_concurrency_clone.write().await;
+
+                                        if avg_mbps < 1.0 && *concurrency > 4 {
+                                            // 带宽低，减少并发
+                                            *concurrency = (*concurrency * 3) / 4;
+                                            debug!(
+                                                "带宽低 ({:.2} Mbps)，减少并发至 {}",
+                                                avg_mbps, *concurrency
+                                            );
+                                        } else if avg_mbps > 5.0
+                                            && *concurrency < config.max_concurrent_downloads * 2
+                                        {
+                                            // 带宽充足，增加并发
+                                            *concurrency = (*concurrency * 5) / 4;
+                                            debug!(
+                                                "带宽充足 ({:.2} Mbps)，增加并发至 {}",
+                                                avg_mbps, *concurrency
+                                            );
+                                        }
+                                    }
+                                }
+
+                                debug!(
+                                    "成功下载并保存片段 {} ({} 字节, {:.2} Mbps)",
+                                    idx, bytes, mbps
+                                );
                             }
                         }
                         to_download.write().await.remove(&idx);
@@ -255,6 +362,12 @@ async fn main() -> Result<()> {
                     Err(e) => {
                         error!("片段 {} 处理失败: {:?}", idx, e);
                     }
+                }
+
+                // 清理状态
+                {
+                    let mut status = download_status_clone.write().await;
+                    status.remove(&idx);
                 }
             });
 
@@ -321,7 +434,7 @@ async fn main() -> Result<()> {
             .stdin
             .as_mut()
             .ok_or_else(|| anyhow!("无法打开 FFmpeg 标准输入"))?;
-        let mut buffered_stdin = BufWriter::with_capacity(config.buffer_size, ffmpeg_stdin);
+        let mut buffered_stdin = BufWriter::with_capacity(buffer_size, ffmpeg_stdin);
 
         // 进度追踪并写入FFmpeg
         let mut processed_segments = 0;

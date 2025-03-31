@@ -43,7 +43,7 @@ fn parse_m3u8_with_depth<'a>(
             return Err(anyhow!("M3U8 URL 不能为空"));
         }
 
-        info!("获取 M3U8 内容，URL: {}", m3u8_url);
+        debug!("获取 M3U8 内容，URL: {}", m3u8_url);
 
         // 设置超时时间为10秒
         let response = match timeout(Duration::from_secs(10), client.get(m3u8_url).send()).await {
