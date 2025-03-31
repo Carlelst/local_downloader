@@ -1,31 +1,18 @@
-
-#m3u8_url: https://surrit.com/57ab80c5-76d1-42c2-94a8-a04aa33b132c/842x480/video.m3u8
-#m3u8_url: https://surrit.com/6627cc39-0722-459b-84c8-6a8d0e807d2b/1280x720/video.m3u8
-#m3u8_url: https://surrit.com/65392576-034e-46bf-8553-d5bfe9490c07/1280x720/video.m3u8
-#m3u8_url: https://surrit.com/c308e098-844e-458f-8186-342e31c46640/1280x720/video.m3u8
-#m3u8_url: https://surrit.com/d5bd3243-ce64-4192-822a-6a312e976275/1280x720/video.m3u8
-#m3u8_url: https://surrit.com/8aceaee0-3622-408c-9682-0c536e1f59e5/1280x720/video.m3u8
-#m3u8_url: https://surrit.com/43078f3a-603b-43dd-a56c-dcf1aa898e9e/1280x720/video.m3u8
-#m3u8_url: https://surrit.com/382db5c5-cc8f-4cb0-9c1f-f667f0950f41/1280x720/video.m3u8
-#m3u8_url: https://surrit.com/f61dcce3-8409-4d8f-82a3-0a98b868292e/1280x720/video.m3u8
-#m3u8_url: https://surrit.com/ccbc91a4-f751-4ff9-a1fd-9d1cce1709a0/1280x720/video.m3u8
-#m3u8_url: https://surrit.com/4986c3eb-9810-4386-9d34-45d56e7dcbca/1280x720/video.m3u8
-#m3u8_url: https://surrit.com/38d6f02f-73a3-43e0-bf98-d9acbf9526bc/1280x720/video.m3u8
 m3u8_urls:
-  - https://surrit.com/f6c84df2-87c3-4ec8-9a45-42336f57d67c/842x480/video.m3u8
-  - https://surrit.com/63be1a6e-e121-4c37-8571-4b884570710e/1280x720/video.m3u8
-#m3u8_url: https://surrit.com/3ca77eb3-8b2a-4311-bb58-20e2ef8ea483/1280x720/video.m3u8
-#m3u8_url: https://surrit.com/492cba60-cd08-4311-a5c9-5d6bc52802fd/1280x720/video.m3u8
-#m3u8_url: https://surrit.com/5deb1f15-60a0-4630-850d-2f1c2363bfa3/1280x720/video.m3u8
-#m3u8_url: https://surrit.com/3e573cc1-e3d4-4304-9525-7ea1ba5a50ee/842x480/video.m3u8
-#m3u8_url: https://surrit.com/607b5820-07a4-4d41-8ff7-156133fc5db8/1280x720/video.m3u8
-#m3u8_url: https://surrit.com/ea8c222b-d575-4207-9deb-63d944aefa8d/1280x720/video.m3u8
-#m3u8_url: https://surrit.com/75406cb0-1540-45ca-8fcc-2e836ea3a863/1280x720/video.m3u8
-#m3u8_url:
+  - https://s8-e1.tfboyaaa.com/ppot/_definst_/mp4:s16/ivod/dhp-cnlf-04-02A141D49.mp4/chunklist.m3u8?vendtime=1743618642&vhash=8dk1-zJxmdVbLngu4a5MSfRPtqe734TsJ2kJ-IxFwiI=&vCustomParameter=0_213.218.255.205_HK_1_0&lb=b71f89bc3bd8d017e8a1ca03af9be3cb&us=1&proxy=SpWjPJ4kT6PYRtbXOM4kOsyslZcS5hAObpepCJUyM5XOYvZRsryEPmMifYNEZCnDxomiB6NCRUslZcS5hAObpepCJUyM5XP2vZRsryEPmMifYNEZCnDxomiBANCRUs1&vv=e3c48e2bd792f400e0098e7a9f6fc372&pub=CJSqCpGqCZ8qC2uuCZPVI4jVCZ4pBZ8nE2uoDJKkCZ0rNsLXP6CoOpPZOJ8uDpGsEMOvC3DXEJ9ZP3OrP6HYOsCpNsGqE6CtC38tP3SpDpTYPZTbP64rEMCvCs8qPJTZE65c
 
+# 下载配置
 max_concurrent_downloads: 8  # 下载并行数
-download_retries: 5  # 下载重试次数
-segment_timeout: 40  # 每个片段下载的超时时间，单位：秒
-retry_interval: 3    # 重试间隔时间，单位：秒
-log_level: "debug"  # 日志级别，可选："debug", "info", "warn", "error"
-output_directory: "."  # 输出文件的目录
+download_retries: 5          # 下载重试次数
+segment_timeout: 40          # 每个片段下载的超时时间，单位：秒
+retry_interval: 3            # 重试间隔时间，单位：秒
+
+# 输出配置
+output_directory: "./downloads"  # 输出文件的目录
+video_format: "mp4"              # 输出视频格式，如 mp4, mkv, flv
+video_codec: "copy"              # 视频编码，通常使用 copy 以避免重新编码
+audio_codec: "aac"               # 音频编码，如 aac, copy, mp3
+
+# 系统配置
+log_level: "info"                # 日志级别，可选："debug", "info", "warn", "error"
+buffer_size: 4194304             # 缓冲区大小（字节），默认 4MB

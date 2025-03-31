@@ -1,13 +1,14 @@
 [package]
 name = "video_processor"
 version = "0.1.0"
-edition = "2018"
+edition = "2021"
 
 [lib]
 name = "video_processor"
 path = "./src/lib.rs"
 
 [dependencies]
+thiserror = "1.0" # 确保错误处理库版本兼容
 # 异步运行时和并发支持
 tokio = { version = "1", features = ["full"] }
 
@@ -40,7 +41,3 @@ rand = "0.8"
 criterion = "0.3"
 tokio-test = "0.4"
 mockito = "0.31.0"
-
-# 可选的 future 支持
-[futures]
-optional = true

@@ -1,4 +1,4 @@
-use log::error;
+use log::{error};
 use reqwest::Client;
 use tokio::sync::{mpsc, RwLock};
 use anyhow::Result;
