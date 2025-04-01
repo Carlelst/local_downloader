@@ -122,19 +122,25 @@ pub async fn process_segment(
 
     // 解密数据（如果需要）
     let processed_data = if let (Some(key), Some(iv)) = (&aes_key, &aes_iv) {
-        debug!("解密片段 {}, 大小: {} 字节", idx, data.len());
-        match decrypt_segment(&data, key, iv) {
-            Ok(decrypted) => {
-                debug!(
-                    "解密成功，片段 {} 解密后大小: {} 字节",
-                    idx,
-                    decrypted.len()
-                );
-                decrypted
-            }
-            Err(e) => {
-                warn!("解密片段 {} 失败: {}，使用原始数据", idx, e);
-                data.clone()
+        // 检查是否是图片文件，如果是则跳过解密
+        if url.ends_with(".jpg") || url.ends_with(".jpeg") {
+            debug!("跳过图片片段 {} 的解密步骤", idx);
+            data.clone()
+        } else {
+            debug!("解密片段 {}, 大小: {} 字节", idx, data.len());
+            match decrypt_segment(&data, key, iv) {
+                Ok(decrypted) => {
+                    debug!(
+                        "解密成功，片段 {} 解密后大小: {} 字节",
+                        idx,
+                        decrypted.len()
+                    );
+                    decrypted
+                }
+                Err(e) => {
+                    warn!("解密片段 {} 失败: {}，使用原始数据", idx, e);
+                    data.clone()
+                }
             }
         }
     } else {

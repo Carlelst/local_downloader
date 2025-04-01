@@ -43,7 +43,7 @@ fn parse_m3u8_with_depth<'a>(
             return Err(anyhow!("M3U8 URL 不能为空"));
         }
 
-        debug!("获取 M3U8 内容，URL: {}", m3u8_url);
+        info!("获取 M3U8 内容，URL: {}", m3u8_url);
 
         // 设置超时时间为10秒
         let response = match timeout(Duration::from_secs(10), client.get(m3u8_url).send()).await {
@@ -62,6 +62,12 @@ fn parse_m3u8_with_depth<'a>(
             return Err(anyhow!("M3U8 内容为空，URL: {}", m3u8_url));
         }
 
+        // 检查是否是 jpeg 文件
+        if m3u8_url.ends_with(".jpeg") || m3u8_url.ends_with(".jpg") {
+            info!("检测到 jpeg 文件，直接返回 URL");
+            return Ok((vec![m3u8_url.to_string()], None, None));
+        }
+
         if !m3u8_content.contains("#EXTM3U") {
             warn!("可能不是有效的 M3U8 文件: 未找到 #EXTM3U 标识符");
         }
@@ -71,13 +77,16 @@ fn parse_m3u8_with_depth<'a>(
 
         // 解析基础 URL，用于构建相对路径
         let base_url = match Url::parse(m3u8_url) {
-            Ok(url) => match url.join(".") {
-                Ok(base) => base,
-                Err(e) => {
-                    warn!("无法解析基础 URL，使用原始 URL: {}", e);
-                    url
+            Ok(url) => {
+                // 获取 m3u8 文件所在目录的 URL
+                let mut path = url.path().to_string();
+                if let Some(pos) = path.rfind('/') {
+                    path.truncate(pos + 1);
                 }
-            },
+                let mut base = url.clone();
+                base.set_path(&path);
+                base
+            }
             Err(e) => {
                 warn!("URL 解析失败: {}", e);
                 return Err(anyhow!("无效的 M3U8 URL: {}", m3u8_url));
@@ -116,7 +125,7 @@ async fn process_media_playlist(
     base_url: &Url,
     client: &Client,
 ) -> Result<(Vec<String>, Option<Vec<u8>>, Option<Vec<u8>>)> {
-    // 提取所有 .ts 片段
+    // 提取所有片段
     let mut ts_urls = Vec::new();
     let mut processed_urls = HashSet::new(); // 用于去重
     let lines: Vec<&str> = m3u8_content.lines().collect();
@@ -128,25 +137,18 @@ async fn process_media_playlist(
         if line.starts_with("#EXTINF:") && i + 1 < lines.len() {
             let next_line = lines[i + 1].trim();
             if !next_line.starts_with('#') && !next_line.is_empty() {
-                if next_line.contains(".ts")
-                    || next_line.contains(".m4s")
-                    || next_line.contains(".mp4")
-                {
-                    let ts_url = transform_line_to_url(next_line, base_url);
-                    if !ts_url.is_empty() && !processed_urls.contains(&ts_url) {
-                        processed_urls.insert(ts_url.clone());
-                        ts_urls.push(ts_url);
-                    }
-                }
-            }
-        } else if !line.starts_with('#') && !line.is_empty() {
-            // 直接是片段URL的情况
-            if line.contains(".ts") || line.contains(".m4s") || line.contains(".mp4") {
-                let ts_url = transform_line_to_url(line, base_url);
+                let ts_url = transform_line_to_url(next_line, base_url);
                 if !ts_url.is_empty() && !processed_urls.contains(&ts_url) {
                     processed_urls.insert(ts_url.clone());
                     ts_urls.push(ts_url);
                 }
+            }
+        } else if !line.starts_with('#') && !line.is_empty() {
+            // 直接是片段URL的情况
+            let ts_url = transform_line_to_url(line, base_url);
+            if !ts_url.is_empty() && !processed_urls.contains(&ts_url) {
+                processed_urls.insert(ts_url.clone());
+                ts_urls.push(ts_url);
             }
         }
     }
@@ -284,7 +286,7 @@ async fn process_media_playlist(
 /// - `base_url`: M3U8 文件的基础 URL
 ///
 /// # 返回
-/// 返回完整的 ts 或 jpeg URL。
+/// 返回完整的 URL。
 fn transform_line_to_url(line: &str, base_url: &Url) -> String {
     let line = line.trim();
 
@@ -297,21 +299,12 @@ fn transform_line_to_url(line: &str, base_url: &Url) -> String {
         return line.to_string();
     }
 
-    // 对于视频片段文件使用 base_url
-    if line.contains(".ts")
-        || line.contains(".m4s")
-        || line.contains(".mp4")
-        || line.ends_with(".jpeg")
-        || line.ends_with(".jpg")
-    {
-        return match base_url.join(line) {
-            Ok(url) => url.to_string(),
-            Err(e) => {
-                warn!("URL 拼接失败: {}，使用原始字符串: {}", e, line);
-                line.to_string()
-            }
-        };
+    // 尝试使用基础URL拼接
+    match base_url.join(line) {
+        Ok(url) => url.to_string(),
+        Err(e) => {
+            warn!("URL 拼接失败: {}，使用原始字符串: {}", e, line);
+            line.to_string()
+        }
     }
-
-    line.to_string()
 }

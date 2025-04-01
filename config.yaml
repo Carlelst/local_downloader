@@ -1,5 +1,6 @@
 m3u8_urls:
-  - https://s8-e1.tfboyaaa.com/ppot/_definst_/mp4:s16/ivod/dhp-cnlf-04-02A141D49.mp4/chunklist.m3u8?vendtime=1743618642&vhash=8dk1-zJxmdVbLngu4a5MSfRPtqe734TsJ2kJ-IxFwiI=&vCustomParameter=0_213.218.255.205_HK_1_0&lb=b71f89bc3bd8d017e8a1ca03af9be3cb&us=1&proxy=SpWjPJ4kT6PYRtbXOM4kOsyslZcS5hAObpepCJUyM5XOYvZRsryEPmMifYNEZCnDxomiB6NCRUslZcS5hAObpepCJUyM5XP2vZRsryEPmMifYNEZCnDxomiBANCRUs1&vv=e3c48e2bd792f400e0098e7a9f6fc372&pub=CJSqCpGqCZ8qC2uuCZPVI4jVCZ4pBZ8nE2uoDJKkCZ0rNsLXP6CoOpPZOJ8uDpGsEMOvC3DXEJ9ZP3OrP6HYOsCpNsGqE6CtC38tP3SpDpTYPZTbP64rEMCvCs8qPJTZE65c
+  - 
+
 
 # 下载配置
 max_concurrent_downloads: 8  # 下载并行数
