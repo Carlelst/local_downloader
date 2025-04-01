@@ -1,12 +1,13 @@
 m3u8_urls:
-  - 
+  #- 
 
 
 # 下载配置
-max_concurrent_downloads: 8  # 下载并行数
-download_retries: 5          # 下载重试次数
-segment_timeout: 40          # 每个片段下载的超时时间，单位：秒
-retry_interval: 3            # 重试间隔时间，单位：秒
+max_concurrent_downloads: 16  # 增加并发下载数
+download_retries: 3          # 减少重试次数以加快失败处理
+segment_timeout: 20          # 减少超时时间
+retry_interval: 2            # 减少重试间隔
+chunk_size: 2097152         # 增加下载块大小到 2MB
 
 # 输出配置
 output_directory: "./downloads"  # 输出文件的目录
@@ -16,4 +17,7 @@ audio_codec: "aac"               # 音频编码，如 aac, copy, mp3
 
 # 系统配置
 log_level: "info"                # 日志级别，可选："debug", "info", "warn", "error"
-buffer_size: 4194304             # 缓冲区大小（字节），默认 4MB
+buffer_size: 8388608             # 缓冲区大小（字节），默认 8MB
+validate_segments: false        # 禁用片段验证以加快启动
+use_hw_accel: true             # 启用硬件加速
+thread_count: 4               # 设置 FFmpeg 线程数
