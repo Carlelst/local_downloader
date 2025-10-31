@@ -106,7 +106,7 @@ pub async fn download_with_retry(
                     true
                 } else if e.to_string().contains("429") {
                     // 速率限制，需要更长时间等待
-                    backoff_interval = backoff_interval * 2;
+                    backoff_interval *= 2;
                     true
                 } else if e.to_string().contains("404")
                     || e.to_string().contains("403")

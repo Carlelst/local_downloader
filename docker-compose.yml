@@ -1,16 +1,16 @@
-version: '3'
+version: "3"
 services:
   rust-app:
     build: .
     volumes:
       - .:/usr/src/app
     ports:
-      - "8088:8088"  
+      - "8088:8088"
     # command: cargo watch -x run
     environment:
-      RUST_LOG: "debug"  # 配置环境变量，按需更改
+      RUST_LOG: "debug" # 配置环境变量，按需更改
     depends_on:
-      - database  # 如果需要数据库等其他服务，可在此配置依赖关系
+      - database # 如果需要数据库等其他服务，可在此配置依赖关系
 
   # 示例数据库服务（可选）
   database:
@@ -22,7 +22,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data  # 挂载卷保存数据库数据
+      - pgdata:/var/lib/postgresql/data # 挂载卷保存数据库数据
 
 volumes:
   pgdata:

@@ -6,7 +6,7 @@ use std::time::Instant;
 
 type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 
-const CHUNK_SIZE: usize = 1 * 1024 * 1024; // 1MB per thread
+const CHUNK_SIZE: usize = 1024 * 1024; // 1MB per thread
 
 /// AES-128-CBC解密功能
 ///
@@ -41,13 +41,13 @@ pub fn decrypt_segment(data: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>> {
             elapsed,
             (total_bytes as f64 / 1024.0 / 1024.0) / elapsed.as_secs_f64()
         );
-        return Ok(result);
+        Ok(result)
     } else {
         // 对小数据使用单线程处理
         let result = simple_decrypt(data, key, iv)?;
         let elapsed = start_time.elapsed();
         debug!("单线程解密 {} 字节完成，用时: {:.2?}", total_bytes, elapsed);
-        return Ok(result);
+        Ok(result)
     }
 }
 
@@ -70,7 +70,7 @@ fn parallel_decrypt(data: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>> {
     }
 
     // 计算块数（以CHUNK_SIZE为单位）
-    let chunk_count = (data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    let chunk_count = data.len().div_ceil(CHUNK_SIZE);
     debug!("将数据分成 {} 个块进行并行解密", chunk_count);
 
     // 对于CBC模式，每个块需要前一个块的最后16字节作为IV
