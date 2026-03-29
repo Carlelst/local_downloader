@@ -308,3 +308,38 @@ fn transform_line_to_url(line: &str, base_url: &Url) -> String {
         }
     }
 }
+
+/// 兼容性包装器 - 使用新的M3U8解析器实现
+/// 保持与现有代码的兼容性
+pub async fn parse_m3u8_new(
+    m3u8_url: &str,
+    client: &Client,
+) -> Result<(Vec<String>, Option<Vec<u8>>, Option<Vec<u8>>)> {
+    use crate::domain::services::M3U8Parser;
+    use crate::infrastructure::{DefaultHttpClient, DefaultM3U8Parser};
+
+    // 创建新的HTTP客户端包装器
+    let http_client = Box::new(DefaultHttpClient::with_client(client.clone()));
+
+    // 创建新的M3U8解析器
+    let parser = DefaultM3U8Parser::new(http_client);
+
+    // 解析播放列表
+    let playlist = parser.parse(m3u8_url).await?;
+
+    // 提取片段URL列表
+    let ts_urls: Vec<String> = playlist
+        .segments
+        .iter()
+        .map(|segment| segment.url.clone())
+        .collect();
+
+    // 提取加密信息
+    let (aes_key, aes_iv) = if let Some(encryption) = playlist.encryption {
+        (encryption.key_data, encryption.iv)
+    } else {
+        (None, None)
+    };
+
+    Ok((ts_urls, aes_key, aes_iv))
+}

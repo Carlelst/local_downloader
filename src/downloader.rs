@@ -109,11 +109,14 @@ pub async fn download_with_retry(
                     backoff_interval *= 2;
                     true
                 } else if e.to_string().contains("404")
-                    || e.to_string().contains("403")
                     || e.to_string().contains("401")
                 {
                     // 客户端错误，不太可能通过重试解决
                     false
+                } else if e.to_string().contains("403") {
+                    // 403错误可能是临时的访问限制，使用更长的退避时间
+                    backoff_interval *= 3;
+                    true
                 } else {
                     // 其他错误，使用标准退避
                     true

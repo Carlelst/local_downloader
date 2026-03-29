@@ -93,6 +93,16 @@ async fn main() -> Result<()> {
         .connect_timeout(Duration::from_secs(15))
         .pool_max_idle_per_host(10)
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .default_headers({
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".parse().unwrap());
+            headers.insert("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8".parse().unwrap());
+            headers.insert("Accept-Encoding", "gzip, deflate, br".parse().unwrap());
+            headers.insert("Connection", "keep-alive".parse().unwrap());
+            headers.insert("Upgrade-Insecure-Requests", "1".parse().unwrap());
+            headers.insert("Referer", "https://video.xchina.download/".parse().unwrap());
+            headers
+        })
         .build()?;
     let client = Arc::new(client);
 
@@ -440,6 +450,7 @@ async fn main() -> Result<()> {
         let mut processed_segments = 0;
         let mut next_idx = 0;
         let mut processed_indices = HashSet::new();
+        let mut missing_segments = HashSet::new();
 
         // 有两部分工作：
         // 1. 将已下载的片段按顺序写入FFmpeg
@@ -448,10 +459,16 @@ async fn main() -> Result<()> {
         // 先尝试按顺序写入已下载的片段
         let mut segments_lock = segments.write().await;
         while let Some(data) = segments_lock.remove(&next_idx) {
-            debug!("写入已缓存的片段 {} 到 FFmpeg", next_idx);
-            buffered_stdin.write_all(&data).await?;
-            processed_indices.insert(next_idx);
-            processed_segments += 1;
+            // 检查数据大小，太小的数据可能是无效的
+            if data.len() < 100 {
+                warn!("跳过太小的片段 {} ({} 字节)", next_idx, data.len());
+                missing_segments.insert(next_idx);
+            } else {
+                debug!("写入已缓存的片段 {} 到 FFmpeg", next_idx);
+                buffered_stdin.write_all(&data).await?;
+                processed_indices.insert(next_idx);
+                processed_segments += 1;
+            }
             next_idx += 1;
         }
         drop(segments_lock);
@@ -491,8 +508,14 @@ async fn main() -> Result<()> {
 
             // 尝试处理所有连续的片段
             while let Some(data) = segments_lock.remove(&next_idx) {
-                debug!("写入片段 {} 到 FFmpeg", next_idx);
-                buffered_stdin.write_all(&data).await?;
+                // 检查数据大小，太小的数据可能是无效的
+                if data.len() < 100 {
+                    warn!("跳过太小的片段 {} ({} 字节)", next_idx, data.len());
+                    missing_segments.insert(next_idx);
+                } else {
+                    debug!("写入片段 {} 到 FFmpeg", next_idx);
+                    buffered_stdin.write_all(&data).await?;
+                }
                 next_idx += 1;
             }
         }
@@ -512,13 +535,8 @@ async fn main() -> Result<()> {
         buffered_stdin.flush().await?;
         drop(buffered_stdin);
 
-        // 检查是否有缺失的片段
-        let mut missing_segments = Vec::new();
-        for i in 0..total_segments {
-            if !processed_indices.contains(&i) {
-                missing_segments.push(i);
-            }
-        }
+        // 检查是否有缺失的片段（已经在前面收集）
+        let missing_segments_list: Vec<usize> = missing_segments.into_iter().collect();
 
         // 等待所有下载任务完成
         for task in download_tasks {
@@ -530,7 +548,7 @@ async fn main() -> Result<()> {
             info!("FFmpeg 处理成功: {}", output_file);
 
             // 如果处理成功但有片段缺失，重命名文件以标明不完整
-            if !missing_segments.is_empty() {
+            if !missing_segments_list.is_empty() {
                 let output_path = Path::new(&output_file);
                 let file_stem = output_path
                     .file_stem()

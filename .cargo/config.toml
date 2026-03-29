@@ -1,0 +1,33 @@
+# Project-specific Cargo configuration for Video Processor
+
+[build]
+# Use multiple CPU cores for compilation (auto-detect)
+# jobs = 0  # Commented out as it may cause issues on some systems
+
+[alias]
+# Useful aliases for development workflow
+check-all = "check --all-targets --all-features"
+test-all = "test --all-targets --all-features"
+fmt-all = "fmt --all"
+clippy-all = "clippy --all-targets --all-features -- -D warnings"
+
+# Quick development commands
+dev-check = "check --all-targets"
+dev-test = "test --lib"
+dev-fmt = "fmt"
+dev-clippy = "clippy --all-targets -- -D warnings"
+
+# Testing aliases
+test-unit = "test --lib"
+test-integration = "test --test '*'"
+test-property = "test property"
+test-doc = "test --doc"
+
+# Documentation aliases
+doc-open = "doc --open --no-deps"
+doc-private = "doc --document-private-items --no-deps"
+
+[env]
+# Set environment variables for development
+RUST_BACKTRACE = "1"
+RUST_LOG = "debug"

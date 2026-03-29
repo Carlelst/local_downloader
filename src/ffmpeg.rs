@@ -125,19 +125,28 @@ pub async fn start_ffmpeg(config: &Config) -> Result<(tokio::process::Child, Str
         }
     }
 
-    // 输入参数
-    cmd.arg("-f").arg("mpegts").arg("-i").arg("pipe:0");
+    // 输入参数 - 添加更健壮的MPEG-TS处理参数
+    cmd.arg("-f")
+        .arg("mpegts")
+        .arg("-analyzeduration")
+        .arg("1000000") // 增加分析时长
+        .arg("-probesize")
+        .arg("1000000") // 增加探测大小
+        .arg("-i")
+        .arg("pipe:0");
 
     // 设置线程数
     cmd.arg("-threads").arg(thread_count.to_string());
 
-    // 处理时间戳不连续问题的参数
+    // 处理时间戳不连续问题的参数 - 添加更健壮的错误恢复
     cmd.arg("-avoid_negative_ts")
         .arg("make_zero")
         .arg("-max_interleave_delta")
         .arg("0")
         .arg("-fflags")
-        .arg("+genpts+igndts");
+        .arg("+genpts+igndts+discardcorrupt")
+        .arg("-err_detect")
+        .arg("ignore_err"); // 忽略错误以提高鲁棒性
 
     // 视频和音频编码参数
     if config.video_codec != "copy" || hw_accel.is_none() {
