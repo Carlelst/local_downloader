@@ -1,6 +1,7 @@
 m3u8_urls:
-  - https://hls.jlbwzc.cn/videos5/79503d8215f51fd0df826591b4c1c13e/79503d8215f51fd0df826591b4c1c13e.m3u8?auth_key=1774802140-69c954dcea881-0-2fe55edffbf293caca595d2fa43e7ad5&v=3&time=0&via=91porna&via_bm=dx
-  - 
+  - https://cloud.avking.xyz/20230330/6d53d9f6-5441-4a57-914d-aa24a4b36a41/index.m3u8
+
+
 
 max_concurrent_downloads: 4  # 降低并发下载数以避免服务器限制
 download_retries: 3          # 减少重试次数以加快失败处理

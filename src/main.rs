@@ -92,15 +92,20 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(config.segment_timeout))
         .connect_timeout(Duration::from_secs(15))
         .pool_max_idle_per_host(10)
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
         .default_headers({
             let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".parse().unwrap());
+            headers.insert("Accept", "*/*".parse().unwrap());
             headers.insert("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8".parse().unwrap());
             headers.insert("Accept-Encoding", "gzip, deflate, br".parse().unwrap());
             headers.insert("Connection", "keep-alive".parse().unwrap());
-            headers.insert("Upgrade-Insecure-Requests", "1".parse().unwrap());
-            headers.insert("Referer", "https://video.xchina.download/".parse().unwrap());
+            headers.insert("Sec-Fetch-Dest", "empty".parse().unwrap());
+            headers.insert("Sec-Fetch-Mode", "cors".parse().unwrap());
+            headers.insert("Sec-Fetch-Site", "cross-site".parse().unwrap());
+            headers.insert("sec-ch-ua-platform", "macOS".parse().unwrap());
+            headers.insert("sec-ch-ua", "\"Google Chrome\";v=\"147\", \"Not.A/Brand\";v=\"8\", \"Chromium\";v=\"147\"".parse().unwrap());
+            headers.insert("sec-ch-ua-mobile", "?0".parse().unwrap());
+            headers.insert("Referer", "https://www.javrate.com/".parse().unwrap());
             headers
         })
         .build()?;
