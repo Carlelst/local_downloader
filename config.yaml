@@ -1,8 +1,3 @@
-m3u8_urls:
-  - https://cloud.avking.xyz/20230330/6d53d9f6-5441-4a57-914d-aa24a4b36a41/index.m3u8
-
-
-
 max_concurrent_downloads: 4  # 降低并发下载数以避免服务器限制
 download_retries: 3          # 减少重试次数以加快失败处理
 segment_timeout: 20          # 减少超时时间
@@ -16,8 +11,22 @@ video_codec: "copy"              # 视频编码，通常使用 copy 以避免重
 audio_codec: "aac"               # 音频编码，如 aac, copy, mp3
 
 # 系统配置
-log_level: "info"                # 日志级别，可选："debug", "info", "warn", "error"
+log_level: "debug"                # 日志级别，可选："debug", "info", "warn", "error"
 buffer_size: 8388608             # 缓冲区大小（字节），默认 8MB
 validate_segments: false        # 禁用片段验证以加快启动
 use_hw_accel: true             # 启用硬件加速
 thread_count: 4               # 设置 FFmpeg 线程数
+# 全局默认 Referer（当域名匹配失败时使用）
+referer: "https://www.javrate.com/"
+
+# 域名特定的 Referer 映射
+# 根据 M3U8 URL 的域名自动选择对应的 Referer
+referers:
+  surrit.com: "https://missav.ws/cn/mird-285-uncensored-leak"
+  phncdn.com: "https://www.pornhub.com/"
+
+# Referer 不变，cookie 已不需要（curl-cffi 自动处理 Cloudflare TLS 指纹）
+
+
+m3u8_urls:
+  -  https://surrit.com/af775f7b-e748-4cae-8248-f2928c365658/720p/video.m3u8

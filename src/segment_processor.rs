@@ -1,7 +1,9 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use log::{debug, error, info, warn};
 use reqwest::Client;
 use std::collections::HashMap;
+use std::io::Write;
+use std::process::{Command as StdCommand, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
@@ -10,6 +12,61 @@ use tokio::sync::RwLock;
 use crate::{decrypt_segment, download_with_retry};
 
 const REPORT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// 将 JPEG 图片转换为 MPEG-TS 格式
+async fn convert_jpeg_to_ts(jpeg_data: &[u8]) -> Result<Vec<u8>> {
+    let jpeg_data_clone = jpeg_data.to_vec();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = StdCommand::new("ffmpeg");
+        cmd.arg("-y")
+            .arg("-f")
+            .arg("image2pipe")
+            .arg("-vcodec")
+            .arg("mjpeg")
+            .arg("-i")
+            .arg("pipe:0")
+            .arg("-f")
+            .arg("mpegts")
+            .arg("-c:v")
+            .arg("libx264")
+            .arg("-pix_fmt")
+            .arg("yuv420p")
+            .arg("-preset")
+            .arg("fast")
+            .arg("-crf")
+            .arg("23")
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| anyhow!("启动 FFmpeg 转换进程失败: {}", e))?;
+
+        if let Some(mut stdin) = child.stdin.as_mut() {
+            stdin
+                .write_all(&jpeg_data_clone)
+                .map_err(|e| anyhow!("写入 JPEG 数据失败: {}", e))?;
+        }
+
+        let output = child
+            .wait_with_output()
+            .map_err(|e| anyhow!("等待 FFmpeg 进程失败: {}", e))?;
+
+        if !output.status.success() {
+            return Err(anyhow!(
+                "JPEG 转换失败: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        Ok(output.stdout)
+    })
+    .await??;
+
+    Ok(output)
+}
 
 // 使用Mutex替代unsafe静态变量
 lazy_static::lazy_static! {
@@ -146,6 +203,26 @@ pub async fn process_segment(
     } else {
         debug!("片段 {} 不需要解密", idx);
         data.clone()
+    };
+
+    // 将 JPEG 图片转换为 MPEG-TS 格式
+    let processed_data = if url.ends_with(".jpg") || url.ends_with(".jpeg") {
+        match convert_jpeg_to_ts(&processed_data).await {
+            Ok(ts_data) => {
+                debug!(
+                    "JPEG 转换 TS 成功，片段 {} 转换后大小: {} 字节",
+                    idx,
+                    ts_data.len()
+                );
+                ts_data
+            }
+            Err(e) => {
+                warn!("JPEG 转换 TS 失败: {}，使用原始数据", e);
+                processed_data
+            }
+        }
+    } else {
+        processed_data
     };
 
     // 注意片段大小

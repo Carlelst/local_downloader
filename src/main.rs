@@ -5,7 +5,7 @@ use log::{debug, error, info, warn};
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs::{create_dir_all, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
@@ -13,7 +13,9 @@ use tokio::sync::{mpsc, RwLock, Semaphore};
 use tokio::time::{sleep, Duration, Instant};
 
 use video_processor::{
-    ffmpeg::start_ffmpeg, m3u8_parser::parse_m3u8, parse_log_level,
+    ffmpeg::start_ffmpeg,
+    m3u8_parser::{parse_m3u8_with_format, SegmentFormat},
+    parse_log_level,
     segment_processor::process_segment,
 };
 
@@ -71,6 +73,7 @@ async fn main() -> Result<()> {
     }
 
     // 检查是否指定了比特率
+    let mut global_referer = config.referer.clone();
     for arg in std::env::args() {
         if arg.starts_with("--bitrate=") {
             let bitrate = arg.split('=').nth(1).unwrap_or("2M").to_string();
@@ -85,31 +88,239 @@ async fn main() -> Result<()> {
             // 禁用硬件加速
             info!("禁用硬件加速");
             config.use_hw_accel = false;
+        } else if arg.starts_with("--referer=") {
+            global_referer = arg.split('=').nth(1).unwrap_or(&global_referer).to_string();
+            info!("使用命令行指定的全局 Referer: {}", global_referer);
         }
     }
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(config.segment_timeout))
-        .connect_timeout(Duration::from_secs(15))
-        .pool_max_idle_per_host(10)
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
-        .default_headers({
-            let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert("Accept", "*/*".parse().unwrap());
-            headers.insert("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8".parse().unwrap());
-            headers.insert("Accept-Encoding", "gzip, deflate, br".parse().unwrap());
-            headers.insert("Connection", "keep-alive".parse().unwrap());
-            headers.insert("Sec-Fetch-Dest", "empty".parse().unwrap());
-            headers.insert("Sec-Fetch-Mode", "cors".parse().unwrap());
-            headers.insert("Sec-Fetch-Site", "cross-site".parse().unwrap());
-            headers.insert("sec-ch-ua-platform", "macOS".parse().unwrap());
-            headers.insert("sec-ch-ua", "\"Google Chrome\";v=\"147\", \"Not.A/Brand\";v=\"8\", \"Chromium\";v=\"147\"".parse().unwrap());
-            headers.insert("sec-ch-ua-mobile", "?0".parse().unwrap());
-            headers.insert("Referer", "https://www.javrate.com/".parse().unwrap());
-            headers
-        })
-        .build()?;
-    let client = Arc::new(client);
+    // 根据 URL 域名获取对应的 Referer
+    fn get_referer_for_url(url: &str, config: &video_processor::Config) -> String {
+        // 尝试从 URL 中提取域名
+        if let Ok(parsed) = url::Url::parse(url) {
+            if let Some(host) = parsed.host_str() {
+                // 先尝试完整匹配域名
+                if let Some(referer) = config.referers.get(host) {
+                    return referer.clone();
+                }
+                // 尝试匹配顶级域名（如 surrit.com）
+                let parts: Vec<&str> = host.split('.').collect();
+                if parts.len() >= 2 {
+                    let domain = format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1]);
+                    if let Some(referer) = config.referers.get(&domain) {
+                        return referer.clone();
+                    }
+                }
+            }
+        }
+        // 回退到全局默认 referer
+        config.referer.clone()
+    }
+
+    // 从 M3U8 URL 提取视频 ID 用于输出命名
+    // 优先级：
+    //   1. URL 路径中的 UUID（surrit.com 风格：/UUID/.../video.m3u8）
+    //   2. URL 路径中最后一个非 m3u8 段
+    //   3. URL 的 MD5 哈希（前 10 位）
+    fn extract_video_id(url: &str) -> String {
+        if let Ok(parsed) = url::Url::parse(url) {
+            let segments: Vec<&str> = parsed
+                .path_segments()
+                .map(|s| s.filter(|x| !x.is_empty()).collect())
+                .unwrap_or_default();
+
+            // 1. 寻找 UUID 模式（8-4-4-4-12 十六进制）
+            for seg in &segments {
+                if is_uuid(seg) {
+                    return seg.to_string();
+                }
+            }
+
+            // 2. 找倒数第二个段（路径里通常 <id>/<resolution>/<file>）
+            //    排除掉 "video.m3u8" 之类的通用名
+            if segments.len() >= 2 {
+                let second_last = segments[segments.len() - 2];
+                if !second_last.is_empty()
+                    && second_last != "video"
+                    && !second_last.ends_with(".m3u8")
+                {
+                    return sanitize_filename(second_last);
+                }
+            }
+        }
+        // 3. 回退到 MD5
+        let url_hash = format!("{:x}", md5::compute(url));
+        format!("cf_{}", &url_hash[..10])
+    }
+
+    // 判断字符串是否是 UUID 格式
+    fn is_uuid(s: &str) -> bool {
+        let parts: Vec<&str> = s.split('-').collect();
+        parts.len() == 5
+            && parts[0].len() == 8
+            && parts[1].len() == 4
+            && parts[2].len() == 4
+            && parts[3].len() == 4
+            && parts[4].len() == 12
+            && s.chars().all(|c| c == '-' || c.is_ascii_hexdigit())
+    }
+
+    // 清理文件名（移除不安全字符）
+    fn sanitize_filename(name: &str) -> String {
+        name.chars()
+            .map(|c| match c {
+                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+                _ => c,
+            })
+            .collect()
+    }
+
+    // 根据 URL 获取对应的 Cookie 字符串
+    fn get_cookie_for_url(url: &str, config: &video_processor::Config) -> String {
+        if let Ok(parsed) = url::Url::parse(url) {
+            if let Some(host) = parsed.host_str() {
+                // 先尝试完整匹配域名
+                if let Some(cookie) = config.cookies.get(host) {
+                    return cookie.clone();
+                }
+                // 尝试匹配顶级域名
+                let parts: Vec<&str> = host.split('.').collect();
+                if parts.len() >= 2 {
+                    let domain = format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1]);
+                    if let Some(cookie) = config.cookies.get(&domain) {
+                        return cookie.clone();
+                    }
+                }
+            }
+        }
+        String::new()
+    }
+
+    // 创建 HTTP client 的辅助函数
+    fn create_http_client(referer: &str, cookie: &str, timeout_secs: u64) -> Result<Client> {
+        // 读取系统代理设置（macOS 系统偏好设置 -> 网络 -> 代理）
+        // reqwest 默认会读取 HTTP_PROXY/HTTPS_PROXY 环境变量，
+        // 但在 macOS 上系统代理不会自动写入环境变量，需要手动处理
+        let mut builder = Client::builder()
+            .timeout(Duration::from_secs(timeout_secs))
+            .connect_timeout(Duration::from_secs(15))
+            .pool_max_idle_per_host(10)
+            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36");
+
+        // 检查系统代理环境变量
+        let proxy_url = std::env::var("HTTPS_PROXY")
+            .or_else(|_| std::env::var("https_proxy"))
+            .or_else(|_| std::env::var("HTTP_PROXY"))
+            .or_else(|_| std::env::var("http_proxy"))
+            .or_else(|_| std::env::var("ALL_PROXY"))
+            .or_else(|_| std::env::var("all_proxy"))
+            .ok();
+
+        // 如果环境变量没有设置，尝试读取 macOS 系统代理
+        let proxy_url = if proxy_url.is_none() {
+            #[cfg(target_os = "macos")]
+            {
+                // 从 scutil 读取系统代理
+                if let Ok(output) = std::process::Command::new("scutil").arg("--proxy").output() {
+                    let s = String::from_utf8_lossy(&output.stdout);
+                    let mut http_proxy: Option<String> = None;
+                    let mut http_port: Option<String> = None;
+                    let mut http_enabled = false;
+                    let mut https_enabled = false;
+
+                    for line in s.lines() {
+                        let line = line.trim();
+                        // 解析类似 "HTTPProxy : 127.0.0.1" 或 "HTTPProxy:127.0.0.1"
+                        if line.starts_with("HTTPProxy") {
+                            if let Some(pos) = line.find(':') {
+                                let value = line[pos + 1..].trim().to_string();
+                                if !value.is_empty() {
+                                    http_proxy = Some(value);
+                                }
+                            }
+                        } else if line.starts_with("HTTPPort") {
+                            if let Some(pos) = line.find(':') {
+                                let value = line[pos + 1..].trim().to_string();
+                                if !value.is_empty() {
+                                    http_port = Some(value);
+                                }
+                            }
+                        } else if line.starts_with("HTTPEnable") {
+                            http_enabled = line.contains(": 1") || line.ends_with(": 1");
+                        } else if line.starts_with("HTTPSEnable") {
+                            https_enabled = line.contains(": 1") || line.ends_with(": 1");
+                        }
+                    }
+
+                    // 如果 HTTPS 代理开启，使用它；否则尝试 HTTP 代理
+                    let use_proxy = https_enabled || http_enabled;
+                    if use_proxy {
+                        if let (Some(host), Some(port)) = (http_proxy, http_port) {
+                            debug!("检测到系统代理: {}:{}", host, port);
+                            Some(format!("http://{}:{}", host, port))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                None
+            }
+        } else {
+            proxy_url
+        };
+
+        if let Some(url) = proxy_url {
+            debug!("使用代理: {}", url);
+            match reqwest::Proxy::all(&url) {
+                Ok(proxy) => {
+                    builder = builder.proxy(proxy);
+                }
+                Err(e) => {
+                    warn!("代理配置失败: {}，继续不使用代理", e);
+                }
+            }
+        }
+
+        builder
+            .default_headers({
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert("Accept", "*/*".parse().unwrap());
+                headers.insert(
+                    "Accept-Language",
+                    "zh-CN,zh;q=0.9,en;q=0.8".parse().unwrap(),
+                );
+                // 注意：不要手动设置 Accept-Encoding，让 reqwest 自动处理 gzip/deflate/br 解压
+                headers.insert("Connection", "keep-alive".parse().unwrap());
+                headers.insert("Sec-Fetch-Dest", "empty".parse().unwrap());
+                headers.insert("Sec-Fetch-Mode", "cors".parse().unwrap());
+                headers.insert("Sec-Fetch-Site", "cross-site".parse().unwrap());
+                headers.insert("sec-ch-ua-platform", "macOS".parse().unwrap());
+                headers.insert(
+                    "sec-ch-ua",
+                    "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\""
+                        .parse()
+                        .unwrap(),
+                );
+                headers.insert("sec-ch-ua-mobile", "?0".parse().unwrap());
+                headers.insert("Referer", referer.parse().unwrap());
+                // 如果有自定义 Cookie（用于绕过 Cloudflare），添加 Cookie 头
+                if !cookie.is_empty() {
+                    if let Ok(cookie_value) = cookie.parse() {
+                        headers.insert("Cookie", cookie_value);
+                    }
+                }
+                headers
+            })
+            .build()
+            .map_err(|e| anyhow!("创建HTTP客户端失败: {}", e))
+    }
 
     // 确保输出目录存在
     let download_dir = Path::new(&config.output_directory);
@@ -126,12 +337,53 @@ async fn main() -> Result<()> {
             continue;
         }
 
+        // Cloudflare 旁路：检测到 surrit.com / fourhoi.com 等走 Python+curl-cffi
+        if video_processor::cloudflare_bypass::CloudflareBypassDownloader::needs_bypass(m3u8_url) {
+            let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let downloader =
+                video_processor::cloudflare_bypass::CloudflareBypassDownloader::new(&project_root);
+            let url_referer = get_referer_for_url(m3u8_url, &config);
+            // 智能命名：优先用 URL 中的 UUID，回退到 MD5
+            let base_filename = extract_video_id(m3u8_url);
+            let output_path = download_dir.join(format!("{}.mp4", base_filename));
+            match downloader
+                .download(m3u8_url, &url_referer, &output_path)
+                .await
+            {
+                Ok(_) => {
+                    info!(
+                        "[CF Bypass] ✓ M3U8 [{}] 处理完成: {}",
+                        i + 1,
+                        output_path.display()
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    error!("[CF Bypass] ✗ M3U8 [{}] 失败: {}", i + 1, e);
+                    continue;
+                }
+            }
+        }
+
         debug!(
             "处理 M3U8 文件 [{}/{}]: {}",
             i + 1,
             config.m3u8_urls.len(),
             m3u8_url
         );
+
+        // 根据当前 URL 的域名获取对应的 Referer 和 Cookie，并创建专用的 client
+        let url_referer = get_referer_for_url(m3u8_url, &config);
+        let url_cookie = get_cookie_for_url(m3u8_url, &config);
+        info!("URL {} 使用 Referer: {}", m3u8_url, url_referer);
+        if !url_cookie.is_empty() {
+            debug!("URL {} 使用自定义 Cookie", m3u8_url);
+        }
+        let client = Arc::new(create_http_client(
+            &url_referer,
+            &url_cookie,
+            config.segment_timeout,
+        )?);
 
         // 计算一个基于URL的唯一文件名
         let url_hash = format!("{:x}", md5::compute(m3u8_url));
@@ -144,7 +396,8 @@ async fn main() -> Result<()> {
 
         // 解析M3U8获取片段链接和加密信息
         debug!("解析M3U8: {}", m3u8_url);
-        let (ts_urls, aes_key, aes_iv) = parse_m3u8(m3u8_url, &client).await?;
+        let (ts_urls, aes_key, aes_iv, segment_format) =
+            parse_m3u8_with_format(m3u8_url, &client).await?;
         let total_segments = ts_urls.len();
 
         if total_segments == 0 {
@@ -444,7 +697,7 @@ async fn main() -> Result<()> {
         }
 
         // 获取FFmpeg进程
-        let (mut ffmpeg, output_file) = start_ffmpeg(&config).await?;
+        let (mut ffmpeg, output_file) = start_ffmpeg(&config, segment_format).await?;
         let ffmpeg_stdin = ffmpeg
             .stdin
             .as_mut()

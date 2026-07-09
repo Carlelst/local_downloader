@@ -9,6 +9,21 @@ use std::time::Duration;
 use tokio::time::timeout;
 use url::Url;
 
+/// 片段格式枚举
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SegmentFormat {
+    /// MPEG-TS 格式（.ts 文件）
+    Ts,
+    /// Fragmented MP4 格式（.m4s 文件）
+    Fmp4,
+}
+
+impl Default for SegmentFormat {
+    fn default() -> Self {
+        SegmentFormat::Ts
+    }
+}
+
 /// 解析 M3U8 URL 并返回 ts 片段 URL、AES 密钥及 IV。
 ///
 /// # 参数
@@ -21,11 +36,20 @@ pub async fn parse_m3u8(
     m3u8_url: &str,
     client: &Client,
 ) -> Result<(Vec<String>, Option<Vec<u8>>, Option<Vec<u8>>)> {
+    let (urls, key, iv, _) = parse_m3u8_with_depth(m3u8_url, client, 0).await?;
+    Ok((urls, key, iv))
+}
+
+/// 解析 M3U8 URL 并返回 ts 片段 URL、AES 密钥及 IV，以及片段格式。
+pub async fn parse_m3u8_with_format(
+    m3u8_url: &str,
+    client: &Client,
+) -> Result<(Vec<String>, Option<Vec<u8>>, Option<Vec<u8>>, SegmentFormat)> {
     parse_m3u8_with_depth(m3u8_url, client, 0).await
 }
 
 // 定义返回类型别名，简化代码
-type ParseResult = Result<(Vec<String>, Option<Vec<u8>>, Option<Vec<u8>>)>;
+type ParseResult = Result<(Vec<String>, Option<Vec<u8>>, Option<Vec<u8>>, SegmentFormat)>;
 
 // 内部实现函数，添加递归深度参数防止无限递归
 fn parse_m3u8_with_depth<'a>(
@@ -65,7 +89,7 @@ fn parse_m3u8_with_depth<'a>(
         // 检查是否是 jpeg 文件
         if m3u8_url.ends_with(".jpeg") || m3u8_url.ends_with(".jpg") {
             info!("检测到 jpeg 文件，直接返回 URL");
-            return Ok((vec![m3u8_url.to_string()], None, None));
+            return Ok((vec![m3u8_url.to_string()], None, None, SegmentFormat::Ts));
         }
 
         if !m3u8_content.contains("#EXTM3U") {
@@ -124,10 +148,11 @@ async fn process_media_playlist(
     m3u8_content: &str,
     base_url: &Url,
     client: &Client,
-) -> Result<(Vec<String>, Option<Vec<u8>>, Option<Vec<u8>>)> {
+) -> Result<(Vec<String>, Option<Vec<u8>>, Option<Vec<u8>>, SegmentFormat)> {
     // 提取所有片段
     let mut ts_urls = Vec::new();
     let mut processed_urls = HashSet::new(); // 用于去重
+    let mut segment_format = SegmentFormat::Ts; // 默认 MPEG-TS
     let lines: Vec<&str> = m3u8_content.lines().collect();
 
     for (i, line) in lines.iter().enumerate() {
@@ -139,6 +164,10 @@ async fn process_media_playlist(
             if !next_line.starts_with('#') && !next_line.is_empty() {
                 let ts_url = transform_line_to_url(next_line, base_url);
                 if !ts_url.is_empty() && !processed_urls.contains(&ts_url) {
+                    // 检测片段格式
+                    if ts_url.contains(".m4s") || ts_url.contains("SegmentTemplate") {
+                        segment_format = SegmentFormat::Fmp4;
+                    }
                     processed_urls.insert(ts_url.clone());
                     ts_urls.push(ts_url);
                 }
@@ -147,6 +176,10 @@ async fn process_media_playlist(
             // 直接是片段URL的情况
             let ts_url = transform_line_to_url(line, base_url);
             if !ts_url.is_empty() && !processed_urls.contains(&ts_url) {
+                // 检测片段格式
+                if ts_url.contains(".m4s") || ts_url.contains("SegmentTemplate") {
+                    segment_format = SegmentFormat::Fmp4;
+                }
                 processed_urls.insert(ts_url.clone());
                 ts_urls.push(ts_url);
             }
@@ -271,12 +304,17 @@ async fn process_media_playlist(
     };
 
     info!(
-        "解析结果: {} 个 TS 片段，加密: {}",
+        "解析结果: {} 个 TS 片段，加密: {}，格式: {}",
         ts_urls.len(),
-        if aes_key.is_some() { "是" } else { "否" }
+        if aes_key.is_some() { "是" } else { "否" },
+        if segment_format == SegmentFormat::Ts {
+            "MPEG-TS"
+        } else {
+            "fMP4"
+        }
     );
 
-    Ok((ts_urls, aes_key, iv))
+    Ok((ts_urls, aes_key, iv, segment_format))
 }
 
 /// 转换相对路径为完整 URL

@@ -92,6 +92,7 @@ pub mod downloader;
 pub mod ffmpeg;
 pub mod m3u8_parser;
 pub mod segment_processor;
+pub mod cloudflare_bypass;
 
 // 重新导出模块中的公共函数，方便外部调用
 pub use decryptor::{
@@ -199,6 +200,16 @@ pub struct Config {
     /// Chunk size for downloads in bytes (default: 1MB)
     #[serde(default = "default_chunk_size")]
     pub chunk_size: usize,
+    /// HTTP Referer header for M3U8 and segment requests (global default)
+    #[serde(default = "default_referer")]
+    pub referer: String,
+    /// Domain-specific referer mappings: domain -> referer URL
+    #[serde(default)]
+    pub referers: std::collections::HashMap<String, String>,
+    /// Domain-specific cookie mappings: domain -> cookie string
+    /// 用于绕过 Cloudflare 等反爬机制
+    #[serde(default)]
+    pub cookies: std::collections::HashMap<String, String>,
 }
 
 fn default_output_directory() -> String {
@@ -239,6 +250,10 @@ fn default_thread_count() -> i32 {
 
 fn default_chunk_size() -> usize {
     1024 * 1024 // 默认1MB块大小
+}
+
+fn default_referer() -> String {
+    "https://www.javrate.com/".to_string()
 }
 
 /// Load YAML configuration file and parse it

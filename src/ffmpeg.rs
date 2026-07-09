@@ -1,4 +1,4 @@
-use crate::Config;
+use crate::{m3u8_parser::SegmentFormat, Config};
 use anyhow::{Context, Result};
 use log::{debug, error, info};
 use rand::{distributions::Alphanumeric, Rng};
@@ -52,10 +52,14 @@ async fn detect_hw_accel() -> Option<&'static str> {
 ///
 /// # 参数
 /// - `config`: 应用程序配置
+/// - `segment_format`: 片段格式（MPEG-TS 或 fMP4）
 ///
 /// # 返回
 /// 返回 tokio::process::Child 对象，或在失败时返回错误。
-pub async fn start_ffmpeg(config: &Config) -> Result<(tokio::process::Child, String)> {
+pub async fn start_ffmpeg(
+    config: &Config,
+    segment_format: SegmentFormat,
+) -> Result<(tokio::process::Child, String)> {
     debug!("初始化 FFmpeg 进程");
 
     // 确保输出目录存在
@@ -125,9 +129,21 @@ pub async fn start_ffmpeg(config: &Config) -> Result<(tokio::process::Child, Str
         }
     }
 
-    // 输入参数 - 添加更健壮的MPEG-TS处理参数
+    // 根据片段格式设置输入格式
+    let input_format = match segment_format {
+        SegmentFormat::Ts => {
+            info!("检测到 MPEG-TS 格式");
+            "mpegts"
+        }
+        SegmentFormat::Fmp4 => {
+            info!("检测到 fMP4 格式");
+            "movfrag"
+        }
+    };
+
+    // 输入参数 - 根据片段格式指定输入格式
     cmd.arg("-f")
-        .arg("mpegts")
+        .arg(input_format)
         .arg("-analyzeduration")
         .arg("1000000") // 增加分析时长
         .arg("-probesize")
