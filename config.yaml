@@ -1,4 +1,4 @@
-max_concurrent_downloads: 4  # 降低并发下载数以避免服务器限制
+max_concurrent_downloads: 8  # phncdn 单连接限速 ~1.5-4Mbps，提高并发即提高总带宽
 download_retries: 3          # 减少重试次数以加快失败处理
 segment_timeout: 20          # 减少超时时间
 retry_interval: 2            # 减少重试间隔
@@ -24,9 +24,22 @@ referer: "https://www.javrate.com/"
 referers:
   surrit.com: "https://missav.ws/cn/mird-285-uncensored-leak"
   phncdn.com: "https://www.pornhub.com/"
+  xssz-av.com: "https://cn.xsz-av.com/"
+  v1.xszcdn6.com: "https://cn.xsz-av.com/"
+  v3.xszav.net: "https://cn.xsz-av.com/"
+  # eporner 对未知 Referer 会 302 到 na.mp4 (Not Available) 导致 404，
+  # 必须带自身域名 Referer 或不带
+  eporner.com: "https://www.eporner.com/"
 
 # Referer 不变，cookie 已不需要（curl-cffi 自动处理 Cloudflare TLS 指纹）
 
 
 m3u8_urls:
-  -  https://surrit.com/af775f7b-e748-4cae-8248-f2928c365658/720p/video.m3u8
+- https://dash-s19-n50-nl-cdn.eporner.com/hls/srv6/18096225-1080p.mp4/index-v1-a1.m3u8?hash=WfStIHNNS3k9aONm3Q0UkQ&expires=1791562103&ip=141.11.219.12&id=18096225
+- https://dash-s10-n50-de-cdn.eporner.com/hls/srv5/14464693-1080p-av1.mp4/index-v1-a1.m3u8?hash=x1VuOBHV81lpYdjq-BMY9w&expires=1791562447&ip=141.11.219.12&id=14464693
+- https://dash-s3-c50-fr-cdn.eporner.com/hls/srv6/12379045-1080p.mp4/index-v1-a1.m3u8?hash=fFmMikaeUFKiJwj296Fa1A&expires=1791562497&ip=141.11.219.12&id=12379045
+- 
+
+
+
+

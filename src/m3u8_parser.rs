@@ -36,7 +36,7 @@ pub async fn parse_m3u8(
     m3u8_url: &str,
     client: &Client,
 ) -> Result<(Vec<String>, Option<Vec<u8>>, Option<Vec<u8>>)> {
-    let (urls, key, iv, _) = parse_m3u8_with_depth(m3u8_url, client, 0).await?;
+    let (urls, key, iv, _, _, _) = parse_m3u8_with_depth(m3u8_url, client, 0).await?;
     Ok((urls, key, iv))
 }
 
@@ -44,12 +44,27 @@ pub async fn parse_m3u8(
 pub async fn parse_m3u8_with_format(
     m3u8_url: &str,
     client: &Client,
-) -> Result<(Vec<String>, Option<Vec<u8>>, Option<Vec<u8>>, SegmentFormat)> {
+) -> Result<(
+    Vec<String>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    SegmentFormat,
+    Option<String>,
+    u64,
+)> {
     parse_m3u8_with_depth(m3u8_url, client, 0).await
 }
 
 // 定义返回类型别名，简化代码
-type ParseResult = Result<(Vec<String>, Option<Vec<u8>>, Option<Vec<u8>>, SegmentFormat)>;
+// 元素: (片段URL列表, AES密钥, AES IV [显式], 片段格式, fMP4 init段URL, MEDIA-SEQUENCE 基准值)
+type ParseResult = Result<(
+    Vec<String>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    SegmentFormat,
+    Option<String>,
+    u64,
+)>;
 
 // 内部实现函数，添加递归深度参数防止无限递归
 fn parse_m3u8_with_depth<'a>(
@@ -89,7 +104,14 @@ fn parse_m3u8_with_depth<'a>(
         // 检查是否是 jpeg 文件
         if m3u8_url.ends_with(".jpeg") || m3u8_url.ends_with(".jpg") {
             info!("检测到 jpeg 文件，直接返回 URL");
-            return Ok((vec![m3u8_url.to_string()], None, None, SegmentFormat::Ts));
+            return Ok((
+                vec![m3u8_url.to_string()],
+                None,
+                None,
+                SegmentFormat::Ts,
+                None,
+                0,
+            ));
         }
 
         if !m3u8_content.contains("#EXTM3U") {
@@ -148,15 +170,30 @@ async fn process_media_playlist(
     m3u8_content: &str,
     base_url: &Url,
     client: &Client,
-) -> Result<(Vec<String>, Option<Vec<u8>>, Option<Vec<u8>>, SegmentFormat)> {
+) -> ParseResult {
     // 提取所有片段
     let mut ts_urls = Vec::new();
     let mut processed_urls = HashSet::new(); // 用于去重
     let mut segment_format = SegmentFormat::Ts; // 默认 MPEG-TS
+    let mut init_url: Option<String> = None; // fMP4 init 段（EXT-X-MAP）
     let lines: Vec<&str> = m3u8_content.lines().collect();
 
     for (i, line) in lines.iter().enumerate() {
         let line = line.trim();
+
+        // EXT-X-MAP：fMP4 的 init 段（ftyp+moov），必须先于所有 moof 分片写入
+        if line.starts_with("#EXT-X-MAP:") {
+            if let Some(idx) = line.find("URI=\"") {
+                let rest = &line[idx + 5..];
+                if let Some(end) = rest.find('"') {
+                    let raw = rest[..end].trim();
+                    if !raw.is_empty() {
+                        init_url = Some(transform_line_to_url(raw, base_url));
+                        debug!("检测到 EXT-X-MAP init 段: {}", init_url.as_ref().unwrap());
+                    }
+                }
+            }
+        }
 
         // 如果是EXTINF行，下一行通常是片段URL
         if line.starts_with("#EXTINF:") && i + 1 < lines.len() {
@@ -199,6 +236,13 @@ async fn process_media_playlist(
     }
 
     // 解析加密信息
+    // RFC 8216：未提供 IV 时，应使用 Media Sequence Number 作为 IV（16 字节大端）
+    let media_sequence: u64 = m3u8_content
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("#EXT-X-MEDIA-SEQUENCE:"))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+
     let key_re = Regex::new(
         r#"#EXT-X-KEY:METHOD=([A-Z0-9-]+)(?:,URI=(?:"([^"]+)"|'([^']+)'))?(?:,IV=(?:0x)?([0-9a-fA-F]+))?"#,
     )?;
@@ -226,27 +270,29 @@ async fn process_media_playlist(
                     None => return Err(anyhow!("METHOD=AES-128 但未提供密钥 URI")),
                 };
 
-                let iv = captures
-                    .get(4)
-                    .map(|m| {
+                // RFC 8216 §5.2：无显式 IV 时返回 None，由解密方按
+                // 「MEDIA-SEQUENCE + 分片序号」逐分片计算 IV（见 segment_processor）
+                let iv = match captures.get(4) {
+                    Some(m) => {
                         let iv_str = m.as_str();
                         match hex::decode(iv_str) {
                             Ok(iv) => {
                                 if iv.len() != 16 {
                                     warn!("IV 长度异常: {} 字节，期望 16 字节", iv.len());
                                 }
-                                iv
+                                Some(iv)
                             }
                             Err(e) => {
-                                warn!("IV 解码失败: {}, 原始值: {}", e, iv_str);
-                                vec![0; 16] // 使用全零IV作为回退
+                                return Err(anyhow!(
+                                    "EXT-X-KEY IV 无效 ({})，原始值: {}",
+                                    e,
+                                    iv_str
+                                ));
                             }
                         }
-                    })
-                    .or_else(|| {
-                        info!("未提供 IV，使用默认全零 IV");
-                        Some(vec![0; 16])
-                    });
+                    }
+                    None => None,
+                };
 
                 // 下载密钥
                 debug!("从 URL 获取 AES 密钥: {}", key_url);
@@ -314,7 +360,14 @@ async fn process_media_playlist(
         }
     );
 
-    Ok((ts_urls, aes_key, iv, segment_format))
+    Ok((
+        ts_urls,
+        aes_key,
+        iv,
+        segment_format,
+        init_url,
+        media_sequence,
+    ))
 }
 
 /// 转换相对路径为完整 URL
@@ -380,4 +433,170 @@ pub async fn parse_m3u8_new(
     };
 
     Ok((ts_urls, aes_key, aes_iv))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// 极简本地 HTTP 测试服务器：
+    /// 对每个 GET 请求按"路径包含"匹配返回预置响应，直到路由表清空
+    fn spawn_test_server(
+        listener: TcpListener,
+        routes: Vec<(String, u16, Vec<u8>)>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut routes = routes;
+            while !routes.is_empty() {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let request = String::from_utf8_lossy(&buf);
+                let Some(idx) = routes
+                    .iter()
+                    .position(|(p, _, _)| request.contains(p.as_str()))
+                else {
+                    continue;
+                };
+                let (_, status, body) = routes.remove(idx);
+                let reason = if status == 200 { "OK" } else { "Not Found" };
+                let head = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    status,
+                    reason,
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        })
+    }
+
+    fn bind_test_server() -> (u16, TcpListener) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("绑定测试端口失败");
+        let port = listener.local_addr().unwrap().port();
+        (port, listener)
+    }
+
+    fn no_proxy_client() -> Client {
+        Client::builder()
+            .no_proxy()
+            .build()
+            .expect("构建测试客户端失败")
+    }
+
+    /// RFC 8216: 无 IV 时应使用 Media Sequence Number 作为 IV（16 字节大端）
+    #[tokio::test]
+    async fn test_aes128_without_iv_uses_media_sequence() {
+        let (port, listener) = bind_test_server();
+        let server = spawn_test_server(
+            listener,
+            vec![
+                ("/key.bin".to_string(), 200, vec![0xf3; 16]),
+                (
+                    "/index.m3u8".to_string(),
+                    200,
+                    format!(
+                        "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MEDIA-SEQUENCE:7\n#EXT-X-TARGETDURATION:9\n#EXT-X-KEY:METHOD=AES-128,URI=\"http://127.0.0.1:{port}/key.bin\"\n#EXTINF:8.333,\nhttp://127.0.0.1:{port}/seg0.ts\n"
+                    )
+                    .into_bytes(),
+                ),
+            ],
+        );
+
+        let m3u8_url = format!("http://127.0.0.1:{port}/index.m3u8");
+        let (ts_urls, aes_key, aes_iv, _, init_url, media_sequence) =
+            parse_m3u8_with_format(&m3u8_url, &no_proxy_client())
+                .await
+                .expect("解析 m3u8 应成功");
+
+        server.join().expect("测试服务器线程 panic");
+
+        assert_eq!(ts_urls.len(), 1);
+        assert!(
+            init_url.is_none(),
+            "无 EXT-X-MAP 的播放列表 init 段应为 None"
+        );
+        assert_eq!(aes_key, Some(vec![0xf3; 16]));
+        // RFC 8216 §5.2：无显式 IV 时解析器返回 None + MEDIA-SEQUENCE 基准值，
+        // 由解密方按「MEDIA-SEQUENCE + 分片序号」逐分片计算 16 字节 IV
+        assert!(aes_iv.is_none(), "无显式 IV 时应返回 None 而非伪造 IV");
+        assert_eq!(media_sequence, 7, "应解析出 MEDIA-SEQUENCE 基准值");
+    }
+
+    /// 显式 IV 时应直接使用提供的 IV
+    #[tokio::test]
+    async fn test_aes128_with_explicit_iv() {
+        let (port, listener) = bind_test_server();
+        let server = spawn_test_server(
+            listener,
+            vec![
+                ("/key.bin".to_string(), 200, vec![0xab; 16]),
+                (
+                    "/index.m3u8".to_string(),
+                    200,
+                    format!(
+                        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-KEY:METHOD=AES-128,URI=\"http://127.0.0.1:{port}/key.bin\",IV=0x42b7b97ba0e9d9fd9b6ee632b3b19ec8\n#EXTINF:8.333,\nhttp://127.0.0.1:{port}/seg0.ts\n"
+                    )
+                    .into_bytes(),
+                ),
+            ],
+        );
+
+        let m3u8_url = format!("http://127.0.0.1:{port}/index.m3u8");
+        let (_, aes_key, aes_iv, _, _, _) = parse_m3u8_with_format(&m3u8_url, &no_proxy_client())
+            .await
+            .expect("解析 m3u8 应成功");
+
+        server.join().expect("测试服务器线程 panic");
+
+        assert_eq!(aes_key, Some(vec![0xab; 16]));
+        assert_eq!(
+            aes_iv,
+            Some(hex::decode("42b7b97ba0e9d9fd9b6ee632b3b19ec8").unwrap())
+        );
+    }
+
+    /// fMP4 播放列表应解析出 EXT-X-MAP 指定的 init 段 URL（相对路径需拼接）
+    #[tokio::test]
+    async fn test_fmp4_ext_x_map_parsed() {
+        let (port, listener) = bind_test_server();
+        let server = spawn_test_server(
+            listener,
+            vec![(
+                "/index.m3u8".to_string(),
+                200,
+                format!(
+                    "#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:1\n#EXT-X-MAP:URI=\"init-v1-a1.mp4\"\n#EXTINF:4.000,\nseg-1-v1-a1.m4s\n#EXTINF:4.000,\nseg-2-v1-a1.m4s\n"
+                )
+                .into_bytes(),
+            )],
+        );
+
+        let m3u8_url = format!("http://127.0.0.1:{port}/index.m3u8");
+        let (ts_urls, _, _, segment_format, init_url, _) =
+            parse_m3u8_with_format(&m3u8_url, &no_proxy_client())
+                .await
+                .expect("解析 m3u8 应成功");
+
+        server.join().expect("测试服务器线程 panic");
+
+        assert_eq!(ts_urls.len(), 2);
+        assert_eq!(
+            segment_format,
+            SegmentFormat::Fmp4,
+            ".m4s 分片应识别为 fMP4"
+        );
+        // 相对路径 init 段应基于 m3u8 所在目录拼接
+        assert_eq!(
+            init_url,
+            Some(format!("http://127.0.0.1:{port}/init-v1-a1.mp4")),
+            "EXT-X-MAP 的相对 URI 应解析为完整 URL"
+        );
+    }
 }

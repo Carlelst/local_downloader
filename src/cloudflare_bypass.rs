@@ -26,9 +26,7 @@ pub struct CloudflareBypassDownloader {
 
 impl CloudflareBypassDownloader {
     pub fn new(project_root: &Path) -> Self {
-        // 优先用 miniconda3 里的 Python（含 curl-cffi）
-        let home = std::env::var("HOME").unwrap_or_default();
-        let python_path = PathBuf::from(format!("{}/miniconda3/bin/python3", home));
+        let python_path = detect_python();
         let script_path = project_root.join("scripts/curl_cffi_downloader.py");
 
         Self { python_path, script_path }
@@ -44,16 +42,18 @@ impl CloudflareBypassDownloader {
     ///
     /// - `m3u8_url`: M3U8 地址
     /// - `referer`: 来源页 Referer
+    /// - `cookie`: 可选 Cookie 字符串（部分 CF 站点仍需 cf_clearance）
     /// - `output`: 最终 MP4 输出路径
     pub async fn download(
         &self,
         m3u8_url: &str,
         referer: &str,
+        cookie: &str,
         output: &Path,
     ) -> Result<()> {
         if !self.python_path.exists() {
             return Err(anyhow!(
-                "Python 未找到: {}（请安装 miniconda3 并 pip install curl-cffi）",
+                "Python 解释器未找到: {}（请 pip install curl-cffi，或设置 PYTHON 环境变量）",
                 self.python_path.display()
             ));
         }
@@ -71,13 +71,19 @@ impl CloudflareBypassDownloader {
             .arg("--referer").arg(referer)
             .arg("--output").arg(&output_str)
             .arg("--work-dir").arg(&work_dir_str)
-            .arg("--concurrent").arg("24")
-            .stdout(Stdio::piped())
+            .arg("--concurrent").arg("24");
+        if !cookie.is_empty() {
+            cmd.arg("--cookie").arg(cookie);
+        }
+        cmd.stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        log::info!("[CF Bypass] 启动 curl-cffi 子进程...");
+        log::info!("[CF Bypass] Python: {}", self.python_path.display());
         log::info!("[CF Bypass] URL: {}", m3u8_url);
         log::info!("[CF Bypass] Referer: {}", referer);
+        if !cookie.is_empty() {
+            log::info!("[CF Bypass] Cookie: <{} bytes>", cookie.len());
+        }
         log::info!("[CF Bypass] Output: {}", output_str);
 
         let mut child = cmd.spawn().context("启动 Python 进程失败")?;
@@ -117,4 +123,37 @@ impl CloudflareBypassDownloader {
         log::info!("[CF Bypass] ✓ 下载完成: {}", output.display());
         Ok(())
     }
+}
+
+/// 探测可用的 Python 解释器
+///
+/// 优先级：
+///   1. 环境变量 `PYTHON` 显式指定
+///   2. `which python3` 系统 PATH 中查找
+///   3. `~/miniconda3/bin/python3`（含 curl-cffi 的兼容路径）
+fn detect_python() -> PathBuf {
+    // 1. 环境变量优先
+    if let Ok(p) = std::env::var("PYTHON") {
+        let path = PathBuf::from(p);
+        if path.exists() {
+            return path;
+        }
+    }
+
+    // 2. PATH 中的 python3
+    if let Ok(output) = std::process::Command::new("which").arg("python3").output() {
+        if output.status.success() {
+            let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !s.is_empty() {
+                let p = PathBuf::from(s);
+                if p.exists() {
+                    return p;
+                }
+            }
+        }
+    }
+
+    // 3. miniconda3 fallback（兼容现有安装）
+    let home = std::env::var("HOME").unwrap_or_default();
+    PathBuf::from(format!("{}/miniconda3/bin/python3", home))
 }

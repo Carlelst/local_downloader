@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use chrono::Local;
 use env_logger::Builder;
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -10,14 +10,182 @@ use std::sync::Arc;
 use tokio::fs::{create_dir_all, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::sync::{mpsc, RwLock, Semaphore};
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{sleep, timeout, Duration, Instant};
 
 use video_processor::{
+    decrypt_segment,
     ffmpeg::start_ffmpeg,
-    m3u8_parser::{parse_m3u8_with_format, SegmentFormat},
+    m3u8_parser::parse_m3u8_with_format,
     parse_log_level,
-    segment_processor::process_segment,
+    segment_processor::{media_sequence_iv, process_segment},
 };
+
+/// 保存断点续传元数据（已下载分片索引列表），供正常完成与中途失败两条路径复用
+async fn save_checkpoint(downloaded: &RwLock<HashSet<usize>>, metadata_path: &Path) {
+    let list: Vec<usize> = downloaded.read().await.iter().copied().collect();
+    if let Ok(json) = serde_json::to_string(&list) {
+        if let Ok(mut file) = File::create(metadata_path).await {
+            let _ = file.write_all(json.as_bytes()).await;
+            debug!("已保存断点续传数据: {} 个片段", list.len());
+        }
+    }
+}
+
+// 从 M3U8 URL 提取视频 ID 用于输出命名
+// 优先级：
+//   1. URL 路径中的 UUID（surrit.com 风格：/UUID/.../video.m3u8）
+//   2. URL 路径中最后一个非通用/非分辨率段
+//   3. URL 的 MD5 哈希（前 10 位）
+fn extract_video_id(url: &str) -> String {
+    if let Ok(parsed) = url::Url::parse(url) {
+        let segments: Vec<&str> = parsed
+            .path_segments()
+            .map(|s| s.filter(|x| !x.is_empty()).collect())
+            .unwrap_or_default();
+
+        // 1. 寻找 UUID 模式（8-4-4-4-12 十六进制）
+        for seg in &segments {
+            if is_uuid(seg) {
+                return seg.to_string();
+            }
+        }
+
+        // 2. 从后往前找第一个有意义的段（跳过分辨率/通用名）
+        const SKIP_NAMES: &[&str] = &[
+            "video", "index", "playlist", "master", "chunk", "seg", "segment", "stream", "play",
+            "media", "hls",
+        ];
+        for seg in segments.iter().rev() {
+            let lower = seg.to_ascii_lowercase();
+            if lower.ends_with(".m3u8") || SKIP_NAMES.iter().any(|n| lower == *n) {
+                continue;
+            }
+            if is_resolution(&lower) {
+                continue;
+            }
+            return sanitize_filename(seg);
+        }
+    }
+    // 3. 回退到 MD5
+    let url_hash = format!("{:x}", md5::compute(url));
+    format!("cf_{}", &url_hash[..10])
+}
+
+// 判断字符串是否是分辨率/码率标记（720p / 1080p / 4k / 1920x1080 / 2000kb / 3000kbps）
+fn is_resolution(s: &str) -> bool {
+    // 码率模式：数字 + kb/mb/kbps/mbps
+    for suffix in ["kbps", "mbps", "kb", "mb"] {
+        if let Some(stripped) = s.strip_suffix(suffix) {
+            return !stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_digit());
+        }
+    }
+    if let Some(stripped) = s.strip_suffix('p') {
+        return !stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_digit());
+    }
+    if let Some(stripped) = s.strip_suffix('k') {
+        return !stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_digit());
+    }
+    if s.contains('x') {
+        let parts: Vec<&str> = s.split('x').collect();
+        if parts.len() == 2
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// 判断字符串是否是 UUID 格式
+fn is_uuid(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.len() == 5
+        && parts[0].len() == 8
+        && parts[1].len() == 4
+        && parts[2].len() == 4
+        && parts[3].len() == 4
+        && parts[4].len() == 12
+        && s.chars().all(|c| c == '-' || c.is_ascii_hexdigit())
+}
+
+// 清理文件名（移除不安全字符）
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ => c,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_resolution_bitrate_segments() {
+        // 码率段（vostrely.com 风格 /2000kb/hls/）
+        assert!(is_resolution("2000kb"));
+        assert!(is_resolution("3000kb"));
+        assert!(is_resolution("2000kbps"));
+        assert!(is_resolution("800mbps"));
+        // 非纯数字前缀不是码率
+        assert!(!is_resolution("hZ08wQf1kb"));
+    }
+
+    #[test]
+    fn test_is_resolution_video_resolutions() {
+        assert!(is_resolution("720p"));
+        assert!(is_resolution("1080p"));
+        assert!(is_resolution("4k"));
+        assert!(is_resolution("1920x1080"));
+        assert!(!is_resolution("720x"));
+        assert!(!is_resolution("p720"));
+    }
+
+    #[test]
+    fn test_is_resolution_normal_names() {
+        assert!(!is_resolution("hZ08wQf1"));
+        assert!(!is_resolution("index"));
+        assert!(!is_resolution("hls"));
+        assert!(!is_resolution(""));
+    }
+
+    #[test]
+    fn test_extract_video_id_vostrely() {
+        // 码率段 2000kb 应被跳过，命中 hash 段
+        let id = extract_video_id("https://vostrely.com/20260516/hZ08wQf1/2000kb/hls/index.m3u8");
+        assert_eq!(id, "hZ08wQf1");
+    }
+
+    #[test]
+    fn test_extract_video_id_surrit_uuid() {
+        let id = extract_video_id(
+            "https://surrit.com/2e997f15-8b5e-4a83-9210-3d3e4dfe09a3/720p/video.m3u8",
+        );
+        assert_eq!(id, "2e997f15-8b5e-4a83-9210-3d3e4dfe09a3");
+    }
+
+    #[test]
+    fn test_extract_video_id_phncdn_style() {
+        // index-v1-a1.m3u8 被跳过；720P_4000K_414878711.mp4 非纯分辨率标记，
+        // 从后往前第一个命中
+        let id = extract_video_id(
+            "https://ev-h.phncdn.com/hls/videos/202209/02/414878711/720P_4000K_414878711.mp4/index-v1-a1.m3u8",
+        );
+        assert_eq!(id, "720P_4000K_414878711.mp4");
+    }
+
+    #[test]
+    fn test_extract_video_id_md5_fallback() {
+        // 无有效段时回退 MD5 前缀
+        let id = extract_video_id("https://example.com/master.m3u8");
+        assert!(id.starts_with("cf_"));
+        assert_eq!(id.len(), 13);
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -117,64 +285,6 @@ async fn main() -> Result<()> {
         config.referer.clone()
     }
 
-    // 从 M3U8 URL 提取视频 ID 用于输出命名
-    // 优先级：
-    //   1. URL 路径中的 UUID（surrit.com 风格：/UUID/.../video.m3u8）
-    //   2. URL 路径中最后一个非 m3u8 段
-    //   3. URL 的 MD5 哈希（前 10 位）
-    fn extract_video_id(url: &str) -> String {
-        if let Ok(parsed) = url::Url::parse(url) {
-            let segments: Vec<&str> = parsed
-                .path_segments()
-                .map(|s| s.filter(|x| !x.is_empty()).collect())
-                .unwrap_or_default();
-
-            // 1. 寻找 UUID 模式（8-4-4-4-12 十六进制）
-            for seg in &segments {
-                if is_uuid(seg) {
-                    return seg.to_string();
-                }
-            }
-
-            // 2. 找倒数第二个段（路径里通常 <id>/<resolution>/<file>）
-            //    排除掉 "video.m3u8" 之类的通用名
-            if segments.len() >= 2 {
-                let second_last = segments[segments.len() - 2];
-                if !second_last.is_empty()
-                    && second_last != "video"
-                    && !second_last.ends_with(".m3u8")
-                {
-                    return sanitize_filename(second_last);
-                }
-            }
-        }
-        // 3. 回退到 MD5
-        let url_hash = format!("{:x}", md5::compute(url));
-        format!("cf_{}", &url_hash[..10])
-    }
-
-    // 判断字符串是否是 UUID 格式
-    fn is_uuid(s: &str) -> bool {
-        let parts: Vec<&str> = s.split('-').collect();
-        parts.len() == 5
-            && parts[0].len() == 8
-            && parts[1].len() == 4
-            && parts[2].len() == 4
-            && parts[3].len() == 4
-            && parts[4].len() == 12
-            && s.chars().all(|c| c == '-' || c.is_ascii_hexdigit())
-    }
-
-    // 清理文件名（移除不安全字符）
-    fn sanitize_filename(name: &str) -> String {
-        name.chars()
-            .map(|c| match c {
-                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-                _ => c,
-            })
-            .collect()
-    }
-
     // 根据 URL 获取对应的 Cookie 字符串
     fn get_cookie_for_url(url: &str, config: &video_processor::Config) -> String {
         if let Ok(parsed) = url::Url::parse(url) {
@@ -202,7 +312,9 @@ async fn main() -> Result<()> {
         // reqwest 默认会读取 HTTP_PROXY/HTTPS_PROXY 环境变量，
         // 但在 macOS 上系统代理不会自动写入环境变量，需要手动处理
         let mut builder = Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
+            // 总超时只作兜底（慢速代理下大分片需要较长时间），
+            // 真正的停滞检测由 stream_download 的逐块超时负责
+            .timeout(Duration::from_secs((timeout_secs * 10).max(120)))
             .connect_timeout(Duration::from_secs(15))
             .pool_max_idle_per_host(10)
             .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36");
@@ -220,35 +332,45 @@ async fn main() -> Result<()> {
         let proxy_url = if proxy_url.is_none() {
             #[cfg(target_os = "macos")]
             {
-                // 从 scutil 读取系统代理
+                // 从 scutil 读取系统代理（scutil 输出格式： "<Key> : <Value>"）
                 if let Ok(output) = std::process::Command::new("scutil").arg("--proxy").output() {
                     let s = String::from_utf8_lossy(&output.stdout);
+                    // 精确按 key 解析，避免 "HTTPProxy" 前缀误匹配 "HTTPSProxy"
                     let mut http_proxy: Option<String> = None;
                     let mut http_port: Option<String> = None;
                     let mut http_enabled = false;
                     let mut https_enabled = false;
 
-                    for line in s.lines() {
+                    fn split_kv(line: &str) -> Option<(&str, &str)> {
+                        // 接受 " : " 或 ":" 分隔
                         let line = line.trim();
-                        // 解析类似 "HTTPProxy : 127.0.0.1" 或 "HTTPProxy:127.0.0.1"
-                        if line.starts_with("HTTPProxy") {
-                            if let Some(pos) = line.find(':') {
-                                let value = line[pos + 1..].trim().to_string();
+                        if let Some(idx) = line.find(" : ") {
+                            Some((line[..idx].trim(), line[idx + 3..].trim()))
+                        } else if let Some(idx) = line.find(':') {
+                            Some((line[..idx].trim(), line[idx + 1..].trim()))
+                        } else {
+                            None
+                        }
+                    }
+
+                    for line in s.lines() {
+                        let Some((key, value)) = split_kv(line) else {
+                            continue;
+                        };
+                        match key {
+                            "HTTPProxy" => {
                                 if !value.is_empty() {
-                                    http_proxy = Some(value);
+                                    http_proxy = Some(value.to_string());
                                 }
                             }
-                        } else if line.starts_with("HTTPPort") {
-                            if let Some(pos) = line.find(':') {
-                                let value = line[pos + 1..].trim().to_string();
+                            "HTTPPort" => {
                                 if !value.is_empty() {
-                                    http_port = Some(value);
+                                    http_port = Some(value.to_string());
                                 }
                             }
-                        } else if line.starts_with("HTTPEnable") {
-                            http_enabled = line.contains(": 1") || line.ends_with(": 1");
-                        } else if line.starts_with("HTTPSEnable") {
-                            https_enabled = line.contains(": 1") || line.ends_with(": 1");
+                            "HTTPEnable" => http_enabled = value == "1",
+                            "HTTPSEnable" => https_enabled = value == "1",
+                            _ => {}
                         }
                     }
 
@@ -298,9 +420,9 @@ async fn main() -> Result<()> {
                 );
                 // 注意：不要手动设置 Accept-Encoding，让 reqwest 自动处理 gzip/deflate/br 解压
                 headers.insert("Connection", "keep-alive".parse().unwrap());
-                headers.insert("Sec-Fetch-Dest", "empty".parse().unwrap());
-                headers.insert("Sec-Fetch-Mode", "cors".parse().unwrap());
-                headers.insert("Sec-Fetch-Site", "cross-site".parse().unwrap());
+                // 注意：不要发送 Sec-Fetch-* 头！
+                // eporner 等 CDN 会将 Sec-Fetch-Site: cross-site 视为盗链，
+                // 302 重定向到 na.mp4 导致 404；不发送这些头则畅通
                 headers.insert("sec-ch-ua-platform", "macOS".parse().unwrap());
                 headers.insert(
                     "sec-ch-ua",
@@ -343,11 +465,12 @@ async fn main() -> Result<()> {
             let downloader =
                 video_processor::cloudflare_bypass::CloudflareBypassDownloader::new(&project_root);
             let url_referer = get_referer_for_url(m3u8_url, &config);
+            let url_cookie = get_cookie_for_url(m3u8_url, &config);
             // 智能命名：优先用 URL 中的 UUID，回退到 MD5
             let base_filename = extract_video_id(m3u8_url);
             let output_path = download_dir.join(format!("{}.mp4", base_filename));
             match downloader
-                .download(m3u8_url, &url_referer, &output_path)
+                .download(m3u8_url, &url_referer, &url_cookie, &output_path)
                 .await
             {
                 Ok(_) => {
@@ -385,9 +508,14 @@ async fn main() -> Result<()> {
             config.segment_timeout,
         )?);
 
-        // 计算一个基于URL的唯一文件名
-        let url_hash = format!("{:x}", md5::compute(m3u8_url));
-        let base_filename = url_hash[..10].to_string();
+        // 计算一个基于URL的唯一文件名（智能提取 UUID/有意义段，回退 MD5）
+        // 语义名后附加 URL 短哈希：不同 URL 可能提取出相同语义段（如 …/a/2000kb/ 与 …/a/3000kb/ 都得到 "a"），
+        // 不加哈希会导致断点缓存与输出文件互相污染
+        let base_filename = {
+            let name = extract_video_id(m3u8_url);
+            let hash = format!("{:x}", md5::compute(m3u8_url));
+            format!("{}_{}", name, &hash[..hash.len().min(8)])
+        };
         let metadata_path = temp_dir.join(format!("{}.json", base_filename));
         let segments_dir = temp_dir.join(&base_filename);
         if !segments_dir.exists() {
@@ -396,8 +524,15 @@ async fn main() -> Result<()> {
 
         // 解析M3U8获取片段链接和加密信息
         debug!("解析M3U8: {}", m3u8_url);
-        let (ts_urls, aes_key, aes_iv, segment_format) =
-            parse_m3u8_with_format(m3u8_url, &client).await?;
+        let (ts_urls, aes_key, aes_iv, segment_format, init_url, media_sequence) =
+            match parse_m3u8_with_format(m3u8_url, &client).await {
+                Ok(result) => result,
+                Err(e) => {
+                    // 单个 URL 失败（如 410 签名过期/无效）不中断整体任务，继续下一个
+                    error!("M3U8 [{}] 解析失败，跳过: {}", i + 1, e);
+                    continue;
+                }
+            };
         let total_segments = ts_urls.len();
 
         if total_segments == 0 {
@@ -473,6 +608,8 @@ async fn main() -> Result<()> {
         let (notify_tx, mut notify_rx) = mpsc::channel(pending_segments.max(1));
         let downloaded = Arc::new(RwLock::new(downloaded_segments.clone()));
         let to_download = Arc::new(RwLock::new(HashSet::new()));
+        // 重试耗尽仍失败的分片：跳过写入缺口、计入 incomplete 判定、让进度监控退出
+        let failed_segments = Arc::new(RwLock::new(HashSet::new()));
 
         // 启动段下载任务
         let mut download_tasks = Vec::new();
@@ -538,6 +675,7 @@ async fn main() -> Result<()> {
             let download_status_clone = Arc::clone(&download_status);
             let adaptive_concurrency_clone = Arc::clone(&adaptive_concurrency);
             let bandwidth_monitor_clone = Arc::clone(&bandwidth_monitor);
+            let failed_segments_clone = Arc::clone(&failed_segments);
 
             // 启动下载任务
             let task = tokio::spawn(async move {
@@ -550,86 +688,118 @@ async fn main() -> Result<()> {
                     status.insert(idx, (0, start_time));
                 }
 
-                match process_segment(
-                    client,
-                    url.clone(),
-                    idx,
-                    aes_key,
-                    aes_iv,
-                    segments,
-                    notify_tx.clone(),
-                    timeout,
-                    retries,
-                    retry_interval,
-                )
-                .await
-                {
-                    Ok(data) => {
-                        // 成功下载片段后保存到磁盘
-                        let segment_path = segments_dir.join(format!("{}.ts", idx));
-                        if let Ok(mut file) = File::create(&segment_path).await {
-                            if let Err(e) = file.write_all(&data).await {
-                                warn!("保存片段 {} 失败: {}", idx, e);
-                            } else {
-                                let mut downloaded_lock = downloaded.write().await;
-                                downloaded_lock.insert(idx);
-
-                                // 计算下载速度
-                                let elapsed = start_time.elapsed();
-                                let bytes = data.len();
-                                let mbps = if elapsed.as_millis() > 0 {
-                                    (bytes as f64 * 8.0) / (elapsed.as_millis() as f64) * 1000.0
-                                        / (1024.0 * 1024.0)
+                // 数据校验失败（损坏/污染）时需要重新下载，最多尝试 3 次
+                let mut last_err = None;
+                for attempt in 0..3 {
+                    if attempt > 0 {
+                        warn!("片段 {} 进行第 {} 次重新下载...", idx, attempt + 1);
+                        sleep(Duration::from_secs(2)).await;
+                    }
+                    match process_segment(
+                        client.clone(),
+                        url.clone(),
+                        idx,
+                        aes_key.clone(),
+                        aes_iv.clone(),
+                        segments.clone(),
+                        notify_tx.clone(),
+                        timeout,
+                        retries,
+                        retry_interval,
+                        media_sequence,
+                    )
+                    .await
+                    {
+                        Ok(data) => {
+                            // 成功下载片段后保存到磁盘
+                            let segment_path = segments_dir.join(format!("{}.ts", idx));
+                            if let Ok(mut file) = File::create(&segment_path).await {
+                                if let Err(e) = file.write_all(&data).await {
+                                    warn!("保存片段 {} 失败: {}", idx, e);
                                 } else {
-                                    0.0
-                                };
+                                    let mut downloaded_lock = downloaded.write().await;
+                                    downloaded_lock.insert(idx);
 
-                                // 记录带宽
-                                {
-                                    let mut bw = bandwidth_monitor_clone.write().await;
-                                    bw.push(mbps);
-                                    if bw.len() > 10 {
-                                        bw.remove(0);
-                                    }
+                                    // 计算下载速度
+                                    let elapsed = start_time.elapsed();
+                                    let bytes = data.len();
+                                    let mbps = if elapsed.as_millis() > 0 {
+                                        (bytes as f64 * 8.0) / (elapsed.as_millis() as f64) * 1000.0
+                                            / (1024.0 * 1024.0)
+                                    } else {
+                                        0.0
+                                    };
 
-                                    // 动态调整并发数
-                                    if bw.len() >= 3 {
-                                        let avg_mbps: f64 =
-                                            bw.iter().sum::<f64>() / bw.len() as f64;
-                                        let mut concurrency =
-                                            adaptive_concurrency_clone.write().await;
+                                    // 记录带宽
+                                    {
+                                        let mut bw = bandwidth_monitor_clone.write().await;
+                                        bw.push(mbps);
+                                        if bw.len() > 10 {
+                                            bw.remove(0);
+                                        }
 
-                                        if avg_mbps < 1.0 && *concurrency > 4 {
-                                            // 带宽低，减少并发
-                                            *concurrency = (*concurrency * 3) / 4;
-                                            debug!(
-                                                "带宽低 ({:.2} Mbps)，减少并发至 {}",
-                                                avg_mbps, *concurrency
-                                            );
-                                        } else if avg_mbps > 5.0
-                                            && *concurrency < config.max_concurrent_downloads * 2
-                                        {
-                                            // 带宽充足，增加并发
-                                            *concurrency = (*concurrency * 5) / 4;
-                                            debug!(
-                                                "带宽充足 ({:.2} Mbps)，增加并发至 {}",
-                                                avg_mbps, *concurrency
-                                            );
+                                        // 动态调整并发数
+                                        if bw.len() >= 3 {
+                                            let avg_mbps: f64 =
+                                                bw.iter().sum::<f64>() / bw.len() as f64;
+                                            let mut concurrency =
+                                                adaptive_concurrency_clone.write().await;
+
+                                            if avg_mbps < 1.0 && *concurrency > 4 {
+                                                // 带宽低，减少并发
+                                                *concurrency = (*concurrency * 3) / 4;
+                                                debug!(
+                                                    "带宽低 ({:.2} Mbps)，减少并发至 {}",
+                                                    avg_mbps, concurrency
+                                                );
+                                            } else if avg_mbps > 5.0
+                                                && *concurrency
+                                                    < config.max_concurrent_downloads * 2
+                                            {
+                                                // 带宽充足，增加并发
+                                                *concurrency = (*concurrency * 5) / 4;
+                                                debug!(
+                                                    "带宽充足 ({:.2} Mbps)，增加并发至 {}",
+                                                    avg_mbps, concurrency
+                                                );
+                                            }
                                         }
                                     }
-                                }
 
-                                debug!(
-                                    "成功下载并保存片段 {} ({} 字节, {:.2} Mbps)",
-                                    idx, bytes, mbps
-                                );
+                                    debug!(
+                                        "成功下载并保存片段 {} ({} 字节, {:.2} Mbps)",
+                                        idx, bytes, mbps
+                                    );
+                                }
+                            }
+                            to_download.write().await.remove(&idx);
+                            last_err = None;
+                            break;
+                        }
+                        Err(e) => {
+                            let msg = format!("{:#}", e);
+                            error!("片段 {} 处理失败 (第 {} 次): {}", idx, attempt + 1, msg);
+                            // 内层 download_with_retry 已对网络类错误做过完整重试，
+                            // 外层重试仅针对数据损坏类失败（校验/解密/转换），
+                            // 避免持久性网络错误造成 3×(1+N) 次请求的乘法放大
+                            let is_data_error = msg.contains("校验失败")
+                                || msg.contains("解密")
+                                || msg.contains("转换失败");
+                            last_err = Some(anyhow!(msg));
+                            if !is_data_error {
+                                break;
                             }
                         }
-                        to_download.write().await.remove(&idx);
                     }
-                    Err(e) => {
-                        error!("片段 {} 处理失败: {:?}", idx, e);
-                    }
+                }
+
+                if let Some(e) = last_err {
+                    error!(
+                        "片段 {} 多次尝试后仍失败，将在输出中缺失（文件将标记为 incomplete）: {}",
+                        idx, e
+                    );
+                    failed_segments_clone.write().await.insert(idx);
+                    to_download.write().await.remove(&idx);
                 }
 
                 // 清理状态
@@ -704,6 +874,63 @@ async fn main() -> Result<()> {
             .ok_or_else(|| anyhow!("无法打开 FFmpeg 标准输入"))?;
         let mut buffered_stdin = BufWriter::with_capacity(buffer_size, ffmpeg_stdin);
 
+        // fMP4 必须先写入 EXT-X-MAP 指定的 init 段（ftyp+moov），
+        // 否则 moof 分片缺少解码所需的编码参数，FFmpeg 会直接退出。
+        // init 段处理失败只跳过当前 URL，不中止批量任务（与解析失败的处理一致）
+        if let Some(init_url) = &init_url {
+            info!("下载 fMP4 init 段: {}", init_url);
+            let init_result: Result<Vec<u8>> = async {
+                let resp = match timeout(Duration::from_secs(30), client.get(init_url).send()).await
+                {
+                    Ok(Ok(r)) if r.status().is_success() => r,
+                    Ok(Ok(r)) => return Err(anyhow!("init 段下载失败: HTTP {}", r.status())),
+                    Ok(Err(e)) => return Err(anyhow!("init 段请求失败: {}", e)),
+                    Err(_) => return Err(anyhow!("下载 init 段超时")),
+                };
+                let bytes = resp
+                    .bytes()
+                    .await
+                    .map_err(|e| anyhow!("读取 init 段数据失败: {}", e))?;
+                let mut data = bytes.to_vec();
+                // RFC 8216 §4.3.2.5：EXT-X-KEY 同样作用于 init section，加密流需解密
+                if let Some(key) = &aes_key {
+                    let iv = aes_iv
+                        .clone()
+                        .unwrap_or_else(|| media_sequence_iv(media_sequence));
+                    data = decrypt_segment(&data, key, &iv)
+                        .map_err(|e| anyhow!("init 段解密失败: {}", e))?;
+                }
+                Ok(data)
+            }
+            .await;
+
+            match init_result {
+                Ok(init_data) => {
+                    info!("init 段处理完成: {} 字节", init_data.len());
+                    if let Err(e) = buffered_stdin.write_all(&init_data).await {
+                        error!("M3U8 [{}] 写入 init 段失败，跳过该 URL: {}", i + 1, e);
+                        drop(buffered_stdin);
+                        let _ = ffmpeg.start_kill();
+                        for task in download_tasks.drain(..) {
+                            task.abort();
+                        }
+                        save_checkpoint(&downloaded, &metadata_path).await;
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    error!("M3U8 [{}] init 段处理失败，跳过该 URL: {}", i + 1, e);
+                    drop(buffered_stdin);
+                    let _ = ffmpeg.start_kill();
+                    for task in download_tasks.drain(..) {
+                        task.abort();
+                    }
+                    save_checkpoint(&downloaded, &metadata_path).await;
+                    continue;
+                }
+            }
+        }
+
         // 进度追踪并写入FFmpeg
         let mut processed_segments = 0;
         let mut next_idx = 0;
@@ -765,29 +992,35 @@ async fn main() -> Result<()> {
             let mut segments_lock = segments.write().await;
 
             // 尝试处理所有连续的片段
-            while let Some(data) = segments_lock.remove(&next_idx) {
-                // 检查数据大小，太小的数据可能是无效的
-                if data.len() < 100 {
-                    warn!("跳过太小的片段 {} ({} 字节)", next_idx, data.len());
-                    missing_segments.insert(next_idx);
-                } else {
-                    debug!("写入片段 {} 到 FFmpeg", next_idx);
-                    buffered_stdin.write_all(&data).await?;
+            loop {
+                match segments_lock.remove(&next_idx) {
+                    Some(data) => {
+                        // 检查数据大小，太小的数据可能是无效的
+                        if data.len() < 100 {
+                            warn!("跳过太小的片段 {} ({} 字节)", next_idx, data.len());
+                            missing_segments.insert(next_idx);
+                        } else {
+                            trace!("写入片段 {} 到 FFmpeg", next_idx);
+                            buffered_stdin.write_all(&data).await?;
+                        }
+                        next_idx += 1;
+                    }
+                    None => {
+                        // 分片重试耗尽：跳过缺口继续写入，避免视频在缺口处永久截断
+                        if failed_segments.read().await.contains(&next_idx) {
+                            warn!("跳过失败片段 {}（输出将标记为 incomplete）", next_idx);
+                            missing_segments.insert(next_idx);
+                            next_idx += 1;
+                        } else {
+                            break;
+                        }
+                    }
                 }
-                next_idx += 1;
             }
         }
 
         // 保存当前已下载片段的信息，用于断点续传
-        let downloaded_list = {
-            let downloaded_lock = downloaded.read().await;
-            downloaded_lock.iter().copied().collect::<Vec<_>>()
-        };
-        let json_data = serde_json::to_string(&downloaded_list)?;
-        if let Ok(mut file) = File::create(&metadata_path).await {
-            let _ = file.write_all(json_data.as_bytes()).await;
-            debug!("已保存断点续传数据: {} 个片段", downloaded_list.len());
-        }
+        save_checkpoint(&downloaded, &metadata_path).await;
 
         // 确保所有数据都被写入
         buffered_stdin.flush().await?;
@@ -801,12 +1034,15 @@ async fn main() -> Result<()> {
             let _ = task.await;
         }
 
+        // 重试耗尽的失败分片同样视为缺失
+        let failed_count = failed_segments.read().await.len();
+
         // 等待FFmpeg处理完成
         if ffmpeg.wait().await?.success() {
             info!("FFmpeg 处理成功: {}", output_file);
 
             // 如果处理成功但有片段缺失，重命名文件以标明不完整
-            if !missing_segments_list.is_empty() {
+            if !missing_segments_list.is_empty() || failed_count > 0 {
                 let output_path = Path::new(&output_file);
                 let file_stem = output_path
                     .file_stem()

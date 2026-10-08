@@ -43,6 +43,9 @@ serde_json = "1.0"
 # 随机数生成器
 rand = "0.8"
 
+# 给子进程等待加超时（防止 ffmpeg 卡死冻死 segment worker）
+wait-timeout = "0.2"
+
 # Futures support
 futures = "0.3"
 futures-util = "0.3"

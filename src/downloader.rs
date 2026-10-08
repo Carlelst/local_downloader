@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
-use log::{debug, warn};
+use log::{trace, warn};
 use reqwest::Client;
 use std::time::Duration;
 use tokio::time::{sleep, timeout, Instant};
@@ -74,13 +74,11 @@ pub async fn download_with_retry(
                 } else {
                     0.0
                 };
-
-                debug!(
-                    "下载成功 - 大小: {:.2} KB, 用时: {:.2}s, 速度: {:.2} Mbps, URL: {}",
+                trace!(
+                    "下载成功: {:.2} KB / {:.2}s / {:.2} Mbps",
                     size_kb,
                     elapsed.as_secs_f64(),
-                    mbps,
-                    url
+                    mbps
                 );
                 return Ok(data);
             }
@@ -108,9 +106,7 @@ pub async fn download_with_retry(
                     // 速率限制，需要更长时间等待
                     backoff_interval *= 2;
                     true
-                } else if e.to_string().contains("404")
-                    || e.to_string().contains("401")
-                {
+                } else if e.to_string().contains("404") || e.to_string().contains("401") {
                     // 客户端错误，不太可能通过重试解决
                     false
                 } else if e.to_string().contains("403") {
@@ -183,36 +179,59 @@ async fn stream_download(
     }
 
     let mut stream = response.bytes_stream();
+    let mut interrupted = false;
 
-    while let Ok(Some(chunk_result)) = timeout(timeout_duration, stream.next()).await {
-        let chunk = chunk_result?;
-        let chunk_size = chunk.len();
+    loop {
+        match timeout(timeout_duration, stream.next()).await {
+            Ok(Some(chunk_result)) => {
+                let chunk = chunk_result?;
+                let chunk_size = chunk.len();
 
-        // 调用回调函数处理数据块
-        if let Some(callback) = chunk_callback {
-            callback(downloaded_size, chunk_size, &chunk);
-        }
+                // 调用回调函数处理数据块
+                if let Some(callback) = chunk_callback {
+                    callback(downloaded_size, chunk_size, &chunk);
+                }
 
-        buffer.extend_from_slice(&chunk);
-        downloaded_size += chunk_size;
+                buffer.extend_from_slice(&chunk);
+                downloaded_size += chunk_size;
 
-        // 每5MB打印一次进度
-        if content_length > 0 && downloaded_size % (5 * 1024 * 1024) < chunk_size {
-            let percent = (downloaded_size as f64 / content_length as f64) * 100.0;
-            debug!(
-                "下载进度: {:.1}% ({}/{} 字节)",
-                percent, downloaded_size, content_length
-            );
+                // 每5MB打印一次进度
+                if content_length > 0 && downloaded_size % (5 * 1024 * 1024) < chunk_size {
+                    let percent = (downloaded_size as f64 / content_length as f64) * 100.0;
+                    trace!(
+                        "下载进度: {:.1}% ({}/{} 字节)",
+                        percent,
+                        downloaded_size,
+                        content_length
+                    );
+                }
+            }
+            Ok(None) => break, // 流正常结束
+            Err(_) => {
+                // 读取超时：不能静默返回截断的数据，必须报错以触发重试
+                interrupted = true;
+                break;
+            }
         }
     }
 
-    if content_length > 0 && downloaded_size != content_length as usize {
-        warn!(
-            "内容长度不匹配: 预期 {} 字节，实际下载 {} 字节",
-            content_length, downloaded_size
-        );
+    // 数据不完整时直接报错（触发上层重试），绝不返回截断的数据
+    // 消息附带 timeout/connection 英文关键词，命中 download_with_retry 的快速重试分类
+    if interrupted || (content_length > 0 && downloaded_size != content_length as usize) {
+        let reason = if interrupted {
+            "读取超时 (read timeout)"
+        } else {
+            "连接提前关闭 (connection closed)"
+        };
+        return Err(anyhow!(
+            "下载不完整 ({}): 预期 {} 字节，实际 {} 字节, URL: {}",
+            reason,
+            content_length,
+            downloaded_size,
+            url
+        ));
     }
 
-    debug!("下载完成，总大小: {} 字节, URL: {}", downloaded_size, url);
+    trace!("下载完成: {} 字节", downloaded_size);
     Ok(buffer)
 }

@@ -130,21 +130,15 @@ pub async fn start_ffmpeg(
     }
 
     // 根据片段格式设置输入格式
-    let input_format = match segment_format {
-        SegmentFormat::Ts => {
-            info!("检测到 MPEG-TS 格式");
-            "mpegts"
-        }
-        SegmentFormat::Fmp4 => {
-            info!("检测到 fMP4 格式");
-            "movfrag"
-        }
-    };
-
-    // 输入参数 - 根据片段格式指定输入格式
-    cmd.arg("-f")
-        .arg(input_format)
-        .arg("-analyzeduration")
+    // TS 显式指定 mpegts；fMP4 不指定 -f（"movfrag" 并非有效的 ffmpeg 输入格式），
+    // 让 ffmpeg 自动探测——init 段的 ftyp box 会被 mov/mp4 demuxer 正确识别
+    if segment_format == SegmentFormat::Ts {
+        info!("检测到 MPEG-TS 格式");
+        cmd.arg("-f").arg("mpegts");
+    } else {
+        info!("检测到 fMP4 格式，使用自动探测输入");
+    }
+    cmd.arg("-analyzeduration")
         .arg("1000000") // 增加分析时长
         .arg("-probesize")
         .arg("1000000") // 增加探测大小
@@ -222,11 +216,9 @@ pub async fn start_ffmpeg(
         .arg("-shortest")
         .arg(&output_path_str);
 
-    // 设置日志级别
+    // 设置日志级别（ffmpeg 的 info 会直接向终端刷 progress 行，混入日志输出，故最高只给 warning）
     let log_level = match config.log_level.as_str() {
-        "debug" => "info",
-        "info" => "warning",
-        "warn" | "warning" => "warning",
+        "info" | "warn" | "warning" | "debug" | "trace" => "warning",
         "error" => "error",
         _ => "warning",
     };

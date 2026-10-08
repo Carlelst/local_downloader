@@ -380,6 +380,9 @@ mod tests {
             video_bitrate: Some("2M".to_string()),
             audio_bitrate: Some("128k".to_string()),
             chunk_size: 1024 * 1024,
+            referer: String::new(),
+            referers: std::collections::HashMap::new(),
+            cookies: std::collections::HashMap::new(),
         };
 
         let handler = DefaultFFmpegHandler::new();

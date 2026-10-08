@@ -2137,6 +2137,7 @@ dependencies = [
  "tokio-test",
  "url",
  "uuid",
+ "wait-timeout",
 ]
 
 [[package]]

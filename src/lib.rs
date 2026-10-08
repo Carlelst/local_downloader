@@ -83,6 +83,7 @@ pub mod di;
 /// Compatibility layer for backward compatibility with existing code
 pub mod compatibility;
 
+pub mod cloudflare_bypass;
 /// Legacy modules for backward compatibility
 ///
 /// These modules provide the original API for existing code that hasn't been
@@ -92,7 +93,6 @@ pub mod downloader;
 pub mod ffmpeg;
 pub mod m3u8_parser;
 pub mod segment_processor;
-pub mod cloudflare_bypass;
 
 // 重新导出模块中的公共函数，方便外部调用
 pub use decryptor::{
@@ -291,7 +291,18 @@ fn default_referer() -> String {
 /// ```
 pub fn load_config() -> Result<Config> {
     let file = File::open("config.yaml").context("无法打开配置文件")?;
-    let config: Config = from_reader(file).context("解析配置文件失败")?;
+    let mut config: Config = from_reader(file).context("解析配置文件失败")?;
+    // 防御：从浏览器 DevTools 复制 URL 时可能带入反引号，导致请求 URL 非法
+    for url in &mut config.m3u8_urls {
+        *url = url.trim_matches('`').trim().to_string();
+    }
+    config.referer = config.referer.trim_matches('`').trim().to_string();
+    for referer in config.referers.values_mut() {
+        *referer = referer.trim_matches('`').trim().to_string();
+    }
+    for cookie in config.cookies.values_mut() {
+        *cookie = cookie.trim_matches('`').trim().to_string();
+    }
     Ok(config)
 }
 
