@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         rou.video 悬浮球下载器
 // @namespace    https://rou.video/
-// @version      2.1.3
+// @version      2.2.0
 // @description  在 rou.video / missav 播放页右下角显示悬浮球：自动捕获视频地址并暂存为任务（跨页面持久化），点击球打开管理面板：批量发送下载、实时查看服务端进度、取消/重试、手动添加地址
 // @match        https://rou.video/*
 // @match        https://www.rou.video/*
@@ -92,6 +92,14 @@
             return t.length > 80 ? t.slice(0, 80) : t;
         } catch (e) { return url.slice(0, 60); }
     }
+    // 播放页标题（含视频名）：去掉站点后缀（"xxx - missav" 之类），用作输出文件名
+    function pageTitle() {
+        try {
+            let t = (document.title || '').trim();
+            t = t.replace(/\s*[-|–]\s*(rou\.video|missav[\w.]*|www\.[\w.]+)\s*$/i, '').trim();
+            return t.length > 120 ? t.slice(0, 120) : t;
+        } catch (e) { return ''; }
+    }
     /** 捕获入队：按视频稳定键去重（auth/exp 轮换不产生新条目）。
      *  返回 'new' 新增 / 'refresh' 刷新了已有条目的地址 / false 无变化 */
     function addTask(url, title) {
@@ -100,10 +108,11 @@
         const id = taskId(key);
         const existing = tasks.find((t) => t.id === id);
         if (existing) {
-            // 同一视频重复捕获：仅把地址刷新为最新 auth（旧地址会过期），不新增条目、不重置状态
+            // 同一视频重复捕获：刷新为最新 auth 地址（旧地址会过期）；页面标题可用时一并更新
             if (existing.url !== url) {
                 existing.url = url;
                 existing.t = Date.now();
+                if (title && title.length > 3 && title !== existing.title) existing.title = title;
                 saveTasks(tasks);
                 return 'refresh';
             }
@@ -148,7 +157,8 @@
         if (!url || typeof url !== 'string') return;
         const clean = url.split('#')[0];
         if (M3U8_RE.test(clean) || PLAYLIST_RE.test(clean)) {
-            const r = addTask(clean, titleFromUrl(clean));
+            const title = pageTitle() || titleFromUrl(clean);
+            const r = addTask(clean, title);
             if (r === 'new') {
                 console.log('[rou-dl] ✓ 已捕获并暂存 (' + source + '):', clean);
                 notifyTasksChanged();
@@ -212,6 +222,9 @@
         p.then((resp) => {
             try {
                 if (resp && resp.ok && (resp.type === 'basic' || resp.type === 'cors')) {
+                    // Response.url 是 302 重定向后的最终地址：rou.video 的 API 响应一返回
+                    // 就能拿到带 auth 的播放 URL（无需等重放轮询，实现点击播放即捕获）
+                    if (resp.url) capture(resp.url, 'fetch-最终地址');
                     resp.clone().text().then((t) => captureFromText(t, 'fetch响应')).catch(() => {});
                 }
             } catch (e) { /* 忽略 */ }
@@ -231,6 +244,8 @@
         try {
             this.addEventListener('load', () => {
                 try {
+                    // responseURL 同 fetch 的 resp.url：302 链最终地址，立即捕获
+                    capture(this.responseURL, 'xhr-最终地址');
                     const ct = this.getResponseHeader('content-type') || '';
                     if (/json|text|javascript/i.test(ct)) {
                         captureFromText(this.responseText, 'xhr响应');
@@ -327,6 +342,15 @@
             .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
             .dot.ok { background: #43a047; } .dot.bad { background: #e53935; }
             .p-list { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 0; }
+            .p-list::-webkit-scrollbar { width: 8px; }
+            .p-list::-webkit-scrollbar-track { background: #f5f6f8; }
+            .p-list::-webkit-scrollbar-thumb { background: #c5cad3; border-radius: 4px; }
+            .p-list::-webkit-scrollbar-thumb:hover { background: #a8b0bd; }
+            .p-tabs { display: flex; gap: 6px; padding: 8px 16px 0; }
+            .ptab { font-size: 12px; padding: 4px 12px; border-radius: 12px; cursor: pointer;
+                    background: #f0f2f5; color: #555; user-select: none; }
+            .ptab:hover { background: #e3e7ee; }
+            .ptab.on { background: #2b5fd9; color: #fff; }
             .pg { height: 4px; margin-top: 4px; background: #e8eaf0; border-radius: 2px; overflow: hidden; }
             .pg i { display: block; height: 100%; border-radius: 2px; background: linear-gradient(90deg, #4f8cff, #2b5fd9); transition: width .4s; }
             .item { display: flex; align-items: center; gap: 8px; padding: 8px 16px; border-bottom: 1px solid #f2f2f2; }
@@ -407,6 +431,8 @@
         // ---- 管理面板 ----
         let selected = new Set();
         let sending = false;
+        // 当前 tab：pending 待下载 / active 进行中 / done 已结束
+        let curTab = 'active';
         // 服务端任务状态（GET /status 轮询）：url -> {state,segments,error,name}
         let serverTasks = {};
         let serverCounts = null;
@@ -431,9 +457,10 @@
                 ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
         }
 
-        // 下载中任务的分片进度条（segments_done 由服务端 /status 实时注入）
+        // 分片进度条：排队（0%）与下载中实时显示（segments_done 由服务端 /status 注入）
         function pgBar(sv) {
-            if (!sv || sv.state !== 'downloading' || !sv.segments) return '';
+            if (!sv || !sv.segments) return '';
+            if (sv.state !== 'downloading' && sv.state !== 'queued') return '';
             const dn = sv.segments_done || 0;
             const pct = Math.min(100, Math.round((dn / sv.segments) * 100));
             return `<div class="pg"><i style="width:${pct}%"></i></div>`;
@@ -472,7 +499,10 @@
                     // GM 侧发送失败：点击重置为待下载，可再次批量发送
                     act = '<span class="act" data-act="resend">重试</span>';
                 }
-                return `
+                // 行归属 tab：服务端终态→已结束；已发送未结束→进行中；未发送→待下载
+                const END_SRV = ['done', 'failed', 'cancelled'];
+                const bucket = sv && END_SRV.includes(sv.state) ? 'done' : (t.status === 'sent' ? 'active' : 'pending');
+                return { bucket, html: `
                 <div class="item" data-id="${t.id}" data-url="${esc(t.url)}">
                     <input type="checkbox" ${selected.has(t.id) ? 'checked' : ''}>
                     <div class="info">
@@ -483,7 +513,7 @@
                     ${chip}
                     ${act}
                     <span class="del" title="删除">✕</span>
-                </div>`;
+                </div>` };
             });
             // 服务端有、本列表没有的任务（服务重启前的残留 / 其他页面发送的）
             const srvOnly = Object.values(serverTasks)
@@ -505,7 +535,8 @@
                     const del = ACTIVE_SRV.includes(sv.state)
                         ? ''
                         : '<span class="del" data-del="1" title="从列表移除">✕</span>';
-                    return `
+                    const bucket = ['done', 'failed', 'cancelled'].includes(sv.state) ? 'done' : 'active';
+                    return { bucket, html: `
                 <div class="item srv" data-url="${esc(sv.url)}">
                     <input type="checkbox" disabled>
                     <div class="info">
@@ -516,13 +547,25 @@
                     <span class="st ${cls}">${lbl}</span>
                     ${act}
                     ${del}
-                </div>`;
+                </div>` };
                 });
             const c = serverCounts;
             const cnt = c
                 ? `排队 ${c.queued || 0} · 下载 ${(c.downloading || 0) + (c.cancelling || 0)} · 完成 ${c.done || 0} · 失败 ${(c.failed || 0) + (c.cancelled || 0)}`
                 : '';
             const all = rows.concat(srvOnly);
+            // 按当前 tab 过滤 + 计数（待下载=未发送，进行中=已发送未结束，已结束=服务端终态）
+            const counts = {
+                pending: all.filter((r) => r.bucket === 'pending').length,
+                active: all.filter((r) => r.bucket === 'active').length,
+                done: all.filter((r) => r.bucket === 'done').length,
+            };
+            const shown = all.filter((r) => r.bucket === curTab).map((r) => r.html);
+            const emptyText = {
+                pending: '暂无待下载任务<br>播放视频会自动捕获暂存，也可在下方手动粘贴',
+                active: '暂无进行中的任务<br>切到"待下载"勾选任务后点"下载选中"',
+                done: '暂无已结束的任务',
+            }[curTab];
             panel.innerHTML = `
                 <div class="p-head">
                     <span class="title">下载任务（${all.length}）</span>
@@ -532,7 +575,12 @@
                     <span class="dot" id="rd-dot"></span><span id="rd-srv">检测本地服务…</span>
                     <span style="margin-left:auto" id="rd-cnt">${esc(cnt)}</span>
                 </div>
-                <div class="p-list">${all.length ? all.join('') : '<div class="p-empty">暂无任务<br>打开播放页让视频播放 2-3 秒，会自动捕获暂存</div>'}</div>
+                <div class="p-tabs">
+                    <span class="ptab ${curTab === 'pending' ? 'on' : ''}" data-tab="pending">待下载 ${counts.pending}</span>
+                    <span class="ptab ${curTab === 'active' ? 'on' : ''}" data-tab="active">进行中 ${counts.active}</span>
+                    <span class="ptab ${curTab === 'done' ? 'on' : ''}" data-tab="done">已结束 ${counts.done}</span>
+                </div>
+                <div class="p-list">${shown.length ? shown.join('') : `<div class="p-empty">${emptyText}</div>`}</div>
                 <div class="p-add">
                     <input id="rd-url" type="text" placeholder="手动粘贴视频地址（index.png / .m3u8，含 auth 参数）">
                     <button id="rd-add">添加</button>
@@ -561,7 +609,9 @@
                     ontimeout: () => showTip('取消请求超时', '#ffb74d'),
                 });
             } else if (act === 'retry') {
-                const r = await sendOne({ url });
+                // 重试/重下也带上 GM 存储里的视频标题（地址已刷新但标题不变）
+                const gm = loadTasks().find((t) => t.id === taskId(videoKey(url)));
+                const r = await sendOne({ url, name: gm ? gm.title : '' });
                 showTip(r.ok ? '已重新入队下载' : '重试失败：' + r.msg, r.ok ? '#81c784' : '#ffb74d');
                 pollStatus();
             } else if (act === 'resend') {
@@ -597,6 +647,10 @@
 
         function bindPanel() {
             panel.querySelector('.close').onclick = () => panel.classList.remove('open');
+            // tab 切换（待下载/进行中/已结束）
+            panel.querySelectorAll('.ptab').forEach((el) => {
+                el.onclick = () => { curTab = el.dataset.tab; renderPanel(); };
+            });
             panel.querySelectorAll('.item').forEach((el) => {
                 const id = el.dataset.id;
                 const url = el.dataset.url;
@@ -691,7 +745,8 @@
                     method: 'POST',
                     url: SERVER + '/download',
                     headers: { 'Content-Type': 'application/json' },
-                    data: JSON.stringify({ url: t.url }),
+                    // name = 视频标题：服务端用它做输出文件名（清洗非法字符+防撞哈希）
+                    data: JSON.stringify({ url: t.url, name: t.name || t.title || '' }),
                     timeout: 30000,
                     onload: (resp) => {
                         let data = {};

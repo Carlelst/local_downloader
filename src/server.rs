@@ -32,8 +32,8 @@ use video_processor::png_stream::TaskSignal;
 use video_processor::Config;
 
 use crate::{
-    create_http_client, extract_png_video_id, extract_video_id, get_cookie_for_url,
-    get_referer_for_url,
+    create_http_client, extract_png_video_id, get_cookie_for_url, get_referer_for_url,
+    sanitize_filename,
 };
 
 /// 同时下载的最大视频数（每个视频内部还有分片级并发，避免多视频抢带宽打爆磁盘）
@@ -42,6 +42,9 @@ const MAX_CONCURRENT_VIDEOS: usize = 4;
 #[derive(Deserialize)]
 struct DownloadRequest {
     url: String,
+    /// 视频语义名（来自播放页标题），作为输出文件名前缀；缺省时回退 URL 提取
+    #[serde(default)]
+    name: Option<String>,
 }
 
 /// /cancel 与 /forget 共用的请求体
@@ -255,9 +258,16 @@ async fn handle_download(
     let signal = TaskSignal::new();
     let key = video_key(&url);
     let output_name = {
-        let name = extract_png_video_id(&url);
+        // 优先使用面板传来的视频标题（清洗后），缺省回退 URL 语义段提取；
+        // 两者都附加 URL 短哈希防不同视频撞名（断点缓存与输出文件互相污染）
+        let semantic = req
+            .name
+            .as_deref()
+            .map(sanitize_filename)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| extract_png_video_id(&url));
         let hash = format!("{:x}", md5::compute(&url));
-        format!("{}_{}", name, &hash[..hash.len().min(8)])
+        format!("{}_{}", semantic, &hash[..hash.len().min(8)])
     };
     {
         let mut map = tasks.write().await;
@@ -365,11 +375,17 @@ async fn handle_download(
                 let temp_dir = download_dir.join("temp");
                 let _ = tokio::fs::create_dir_all(&temp_dir).await;
                 let urls = vec![task_url.clone()];
+                // 语义名：output_name 已是"语义_哈希"格式，剥掉尾部哈希传给管线自行重拼
+                let display = output_name
+                    .rsplit_once('_')
+                    .map(|(s, _)| s.to_string())
+                    .unwrap_or_else(|| output_name.clone());
                 crate::process_m3u8_batch(
                     &urls,
                     &config,
                     &download_dir,
                     &temp_dir,
+                    Some(display.as_str()),
                     Some(Arc::clone(&signal)),
                 )
                 .await
@@ -386,7 +402,7 @@ async fn handle_download(
                 }
                 Err(_) => {
                     // 后置清理：删除该任务的分段缓存与半成品输出
-                    cleanup_task_files(&config, kind, &task_url, &output_name).await;
+                    cleanup_task_files(&config, kind, &output_name).await;
                     finalize_task(&tasks, &task_key, "cancelled", "").await;
                     info!("[Server] 任务已取消并清理: {}", task_url);
                 }
@@ -436,7 +452,7 @@ async fn finalize_task(tasks: &TaskMap, url: &str, state: &str, error: &str) {
 }
 
 /// 取消后的后置清理：删除该任务的分段缓存（断点文件）与半成品输出
-async fn cleanup_task_files(config: &Config, kind: PlaylistKind, url: &str, output_name: &str) {
+async fn cleanup_task_files(config: &Config, kind: PlaylistKind, output_name: &str) {
     let download_dir = std::path::Path::new(&config.output_directory);
     match kind {
         // PNG 伪装流分段全在内存，只有 FFmpeg 半成品输出需要清理
@@ -447,12 +463,8 @@ async fn cleanup_task_files(config: &Config, kind: PlaylistKind, url: &str, outp
             }
         }
         PlaylistKind::StandardM3U8 => {
-            // 命名与 process_m3u8_batch 内部一致：extract_video_id + MD5 前 8 位
-            let base = {
-                let name = extract_video_id(url);
-                let hash = format!("{:x}", md5::compute(url));
-                format!("{}_{}", name, &hash[..hash.len().min(8)])
-            };
+            // 命名与 process_m3u8_batch 内部一致：语义名（或 URL 段）_MD5 前 8 位 = output_name
+            let base = output_name;
             let temp_dir = download_dir.join("temp");
             let _ = tokio::fs::remove_dir_all(temp_dir.join(&base)).await;
             let _ = tokio::fs::remove_file(temp_dir.join(format!("{}.json", base))).await;

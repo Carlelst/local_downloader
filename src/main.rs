@@ -138,14 +138,23 @@ fn is_uuid(s: &str) -> bool {
         && s.chars().all(|c| c == '-' || c.is_ascii_hexdigit())
 }
 
-// 清理文件名（移除不安全字符）
+// 清理文件名（移除不安全字符与控制符，压缩空白，限长 80 字符）
 fn sanitize_filename(name: &str) -> String {
-    name.chars()
+    let cleaned: String = name
+        .chars()
         .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            _ => c,
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => ' ',
+            c if (c as u32) < 32 => ' ',
+            c => c,
         })
-        .collect()
+        .collect();
+    let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = cleaned.trim().trim_matches('.').trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    // 限长（按字符截断，避免切坏多字节 UTF-8）
+    trimmed.chars().take(80).collect()
 }
 
 // 根据 URL 获取对应的 Cookie 字符串
@@ -312,15 +321,17 @@ fn create_http_client(referer: &str, cookie: &str, timeout_secs: u64) -> Result<
 
 // 批量处理 M3U8 URL（CLI 与 --server 共用的下载管线，含断点续传/AES 解密/CF bypass）
 // 单条 URL 失败只跳过自身，不中断批量
-/// 批量处理 m3u8 下载（CLI 与 --server 共用管线）
-///
+
 /// `signal` 为任务信号（取消标志+分片完成计数）：--server 模式传入，任务取消后
 /// 在分片/写入检查点快速退出，分片完成时累计进度；CLI 模式传 None。
+/// `display_name` 为视频语义名（来自播放页标题）：提供时输出文件名改为
+/// `{清洗后的语义名}_{url md5 前 8 位}`，未提供时保持 `{extract_video_id}_{md5}`。
 pub async fn process_m3u8_batch(
     urls: &[String],
     config: &video_processor::Config,
     download_dir: &Path,
     temp_dir: &Path,
+    display_name: Option<&str>,
     signal: Option<Arc<TaskSignal>>,
 ) -> Result<()> {
     // 转为 owned，便于下方 spawn 的下载任务捕获（&引用不能逃逸到 'static 任务）
@@ -400,9 +411,18 @@ pub async fn process_m3u8_batch(
         // 语义名后附加 URL 短哈希：不同 URL 可能提取出相同语义段（如 …/a/2000kb/ 与 …/a/3000kb/ 都得到 "a"），
         // 不加哈希会导致断点缓存与输出文件互相污染
         let base_filename = {
-            let name = extract_video_id(m3u8_url);
             let hash = format!("{:x}", md5::compute(m3u8_url));
-            format!("{}_{}", name, &hash[..hash.len().min(8)])
+            match display_name
+                .map(sanitize_filename)
+                .filter(|s| !s.is_empty())
+            {
+                Some(clean) => format!("{}_{}", clean, &hash[..hash.len().min(8)]),
+                None => format!(
+                    "{}_{}",
+                    extract_video_id(m3u8_url),
+                    &hash[..hash.len().min(8)]
+                ),
+            }
         };
         let metadata_path = temp_dir.join(format!("{}.json", base_filename));
         let segments_dir = temp_dir.join(&base_filename);
@@ -1278,7 +1298,15 @@ async fn main() -> Result<()> {
     }
 
     // M3U8 批量下载（管线已提取为独立函数，--server 模式复用同一实现）
-    process_m3u8_batch(&config.m3u8_urls, &config, &download_dir, &temp_dir, None).await?;
+    process_m3u8_batch(
+        &config.m3u8_urls,
+        &config,
+        &download_dir,
+        &temp_dir,
+        None,
+        None,
+    )
+    .await?;
 
     // PNG 伪装流批量下载（rou.video 风格，与 M3U8 流程完全独立）
     for (i, png_url) in config.png_urls.iter().enumerate() {
