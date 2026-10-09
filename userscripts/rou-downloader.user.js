@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         rou.video 悬浮球下载器
 // @namespace    https://rou.video/
-// @version      2.1.0
+// @version      2.1.1
 // @description  在 rou.video / missav 播放页右下角显示悬浮球：自动捕获视频地址并暂存为任务（跨页面持久化），点击球打开管理面板：批量发送下载、实时查看服务端进度、取消/重试、手动添加地址
 // @match        https://rou.video/*
 // @match        https://www.rou.video/*
@@ -203,9 +203,8 @@
     };
 
     // ---------- 1.5 网络记录轮询 ----------
-    const perfPoll = setInterval(() => {
-        if (scanPerformance()) clearInterval(perfPoll);
-    }, 2000);
+    // 持续扫描不停止：SPA 站内导航时 load 只触发一次，后续视频只能靠轮询兜底
+    setInterval(() => scanPerformance(), 2000);
 
     // ---------- 1.6 API 重放兜底 ----------
     // 页面加载时顶层 JS 必定调用过本站 API 获取播放源；GM_xmlhttpRequest 重放
@@ -472,6 +471,7 @@
                 </div>
                 <div class="p-foot">
                     <button id="rd-sel">全选</button>
+                    <button id="rd-scan" title="立刻重放 API / 扫描网络记录与源码">立即捕获</button>
                     <button id="rd-clr" class="danger">清除已结束</button>
                     <span class="grow"></span>
                     <button id="rd-dl" class="primary" ${sending ? 'disabled' : ''}>下载选中 (${selected.size})</button>
@@ -560,6 +560,17 @@
             panel.querySelector('#rd-dl').onclick = () => batchSend();
             panel.querySelector('#rd-add').onclick = addManually;
             panel.querySelector('#rd-url').onkeydown = (e) => { if (e.key === 'Enter') addManually(); };
+            panel.querySelector('#rd-scan').onclick = async () => {
+                const b = panel.querySelector('#rd-scan');
+                b.disabled = true; b.textContent = '扫描中…';
+                const before = loadTasks().length;
+                scanPageSource();
+                scanPerformance();
+                await captureFromApiReplay();
+                renderPanel();
+                const added = loadTasks().length > before;
+                showTip(added ? '捕获到新视频 ✓' : '未捕获到：把视频多播几秒再点一次，或在下方手动粘贴地址', added ? '#81c784' : '#ffb74d');
+            };
         }
 
         // ---- 服务端任务状态轮询（GET /status，2s）----
@@ -728,11 +739,26 @@
             window.addEventListener('load', scanPageSource);
         }
 
-        // load 后 3s 自动 API 重放（不依赖用户操作）
+        // load+3s 首次 API 重放，之后周期重试（SPA 站内导航不会重触发 load，
+        // 且 API 调用可能发生在点击播放之后——周期重试保证最终能捕获）。
+        // 后台标签页跳过重放，避免无谓请求；约 30 分钟后自动停止。
+        const REPLAY_INTERVAL = 10000;
+        const REPLAY_MAX_TRIES = 180;
+        let replayTries = 0;
+        let replayTimer = null;
+        function replayOnce() {
+            if (document.visibilityState !== 'visible') return;
+            replayTries++;
+            if (replayTries > REPLAY_MAX_TRIES) {
+                if (replayTimer) { clearInterval(replayTimer); replayTimer = null; }
+                return;
+            }
+            captureFromApiReplay().then((ok) => { if (ok) notifyTasksChanged(); });
+        }
         window.addEventListener('load', () => {
-            setTimeout(() => captureFromApiReplay().then(refreshAll), 3000);
+            setTimeout(replayOnce, 3000);
+            replayTimer = setInterval(replayOnce, REPLAY_INTERVAL);
         });
-        function refreshAll() { notifyTasksChanged(); }
     } catch (e) {
         console.error('[rou-dl] 悬浮球初始化失败:', e);
     }
