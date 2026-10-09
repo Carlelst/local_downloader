@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         rou.video 悬浮球下载器
 // @namespace    https://rou.video/
-// @version      2.2.1
+// @version      2.2.2
 // @description  在 rou.video / missav 播放页右下角显示悬浮球：自动捕获视频地址并暂存为任务（跨页面持久化），点击球打开管理面板：批量发送下载、实时查看服务端进度、取消/重试、手动添加地址
 // @match        https://rou.video/*
 // @match        https://www.rou.video/*
@@ -95,10 +95,17 @@
             return t.length > 80 ? t.slice(0, 80) : t;
         } catch (e) { return url.slice(0, 60); }
     }
-    // 播放页标题（含视频名）：去掉站点后缀（"xxx - missav" 之类），用作输出文件名
+    // 播放页标题（含视频名）：
+    // - 播放器常在 iframe 里（其 document.title 是"弹幕播放器"等无意义文本）——同源时读顶层标题
+    // - 剥 maccms 通用前缀（"在线播放 - xxx"）与站点后缀（"xxx - missav"）
     function pageTitle() {
         try {
-            let t = (document.title || '').trim();
+            let t = '';
+            try {
+                t = (window.top === window ? document : window.top.document).title || '';
+            } catch (e) { t = document.title || ''; }
+            t = (t || '').trim();
+            t = t.replace(/^\s*(在线播放|立即播放|播放|正片|高清播放)\s*[-|–:：]\s*/i, '');
             t = t.replace(/\s*[-|–]\s*(rou\.video|missav[\w.]*|www\.[\w.]+)\s*$/i, '').trim();
             return t.length > 120 ? t.slice(0, 120) : t;
         } catch (e) { return ''; }
@@ -166,6 +173,9 @@
                 console.log('[rou-dl] ✓ 已捕获并暂存 (' + source + '):', clean);
                 notifyTasksChanged();
                 reportToTop(clean);
+                // 捕获发生时页面 title 可能尚未就绪（播放器 iframe 先加载/标题后设置），
+                // 延迟重试刷新标题（refresh 路径静默，只更新 title/url）
+                [2000, 6000].forEach((ms) => setTimeout(() => addTask(clean, pageTitle() || title), ms));
             } else if (r === 'refresh') {
                 // 同一视频换了新 auth 地址：静默刷新存储，面板打开时自动重绘
                 notifyTasksChanged();
@@ -689,13 +699,21 @@
             panel.querySelector('#rd-scan').onclick = async () => {
                 const b = panel.querySelector('#rd-scan');
                 b.disabled = true; b.textContent = '扫描中…';
-                const before = loadTasks().length;
+                const before = loadTasks().filter((t) => t.status === 'pending').length;
                 scanPageSource();
                 scanPerformance();
                 await captureFromApiReplay();
                 renderPanel();
-                const added = loadTasks().length > before;
-                showTip(added ? '捕获到新视频 ✓' : '未捕获到：把视频多播几秒再点一次，或在下方手动粘贴地址', added ? '#81c784' : '#ffb74d');
+                // 按待下载数变化提示：refresh（已有任务刷新地址/标题）不算新捕获，但也不是失败
+                const added = loadTasks().filter((t) => t.status === 'pending').length;
+                showTip(
+                    added > before
+                        ? '捕获到新视频 ✓'
+                        : (added > 0
+                            ? '视频已在待下载列表中（已刷新地址与标题），无需重复捕获'
+                            : '未捕获到新视频：把视频多播几秒再点一次，或在下方手动粘贴地址'),
+                    added > before ? '#81c784' : '#ffb74d'
+                );
             };
         }
 
