@@ -6,12 +6,12 @@ use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::fs::{create_dir_all, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::sync::{mpsc, RwLock, Semaphore};
 use tokio::time::{sleep, timeout, Duration, Instant};
+use video_processor::png_stream::TaskSignal;
 
 use video_processor::{
     decrypt_segment,
@@ -314,20 +314,20 @@ fn create_http_client(referer: &str, cookie: &str, timeout_secs: u64) -> Result<
 // 单条 URL 失败只跳过自身，不中断批量
 /// 批量处理 m3u8 下载（CLI 与 --server 共用管线）
 ///
-/// `cancel` 为取消标志：--server 模式传入，任务取消后在分片/写入检查点快速退出；
-/// CLI 模式传 None（无取消能力）。
+/// `signal` 为任务信号（取消标志+分片完成计数）：--server 模式传入，任务取消后
+/// 在分片/写入检查点快速退出，分片完成时累计进度；CLI 模式传 None。
 pub async fn process_m3u8_batch(
     urls: &[String],
     config: &video_processor::Config,
     download_dir: &Path,
     temp_dir: &Path,
-    cancel: Option<Arc<AtomicBool>>,
+    signal: Option<Arc<TaskSignal>>,
 ) -> Result<()> {
     // 转为 owned，便于下方 spawn 的下载任务捕获（&引用不能逃逸到 'static 任务）
     let config = config.clone();
 
     // 取消检查辅助：任一检查点命中即快速退出，上层负责落终态与清理
-    let is_cancelled = || cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
+    let is_cancelled = || signal.as_ref().is_some_and(|s| s.is_cancelled());
 
     // 增加自适应并发控制
     let adaptive_concurrency = Arc::new(RwLock::new(config.max_concurrent_downloads));
@@ -564,17 +564,14 @@ pub async fn process_m3u8_batch(
             let adaptive_concurrency_clone = Arc::clone(&adaptive_concurrency);
             let bandwidth_monitor_clone = Arc::clone(&bandwidth_monitor);
             let failed_segments_clone = Arc::clone(&failed_segments);
-            let cancel_flag = cancel.clone();
+            let sig = signal.clone();
 
             // 启动下载任务
             let task = tokio::spawn(async move {
                 let _permit = semaphore.acquire().await.expect("获取信号量失败");
 
                 // 取消检查点：任务取消后快速失败，不再发起新分片下载
-                if cancel_flag
-                    .as_ref()
-                    .is_some_and(|c| c.load(Ordering::Relaxed))
-                {
+                if sig.as_ref().is_some_and(|s| s.is_cancelled()) {
                     failed_segments_clone.write().await.insert(idx);
                     to_download.write().await.remove(&idx);
                     return;
@@ -870,6 +867,10 @@ pub async fn process_m3u8_batch(
                 break;
             }
             received_segments += 1;
+            // 进度上报：每处理完一个分片（含被跳过的失败片）计数 +1
+            if let Some(s) = &signal {
+                s.tick();
+            }
 
             // 更新进度
             {

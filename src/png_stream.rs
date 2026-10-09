@@ -30,6 +30,28 @@ use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Semaphore;
 
+/// --server 模式的任务信号：取消标志 + 分片完成计数。
+/// CLI 调用传 None；server 端通过 Arc 在任务表与下载管线间共享
+pub struct TaskSignal {
+    pub cancel: std::sync::atomic::AtomicBool,
+    pub done: std::sync::atomic::AtomicUsize,
+}
+
+impl TaskSignal {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            cancel: std::sync::atomic::AtomicBool::new(false),
+            done: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn tick(&self) {
+        self.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// PNG 文件签名
 const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 
@@ -198,7 +220,7 @@ pub fn strip_ts_prefix(payload: &[u8]) -> Result<Vec<u8>> {
 /// - `client`: 已按域名配置好 Referer/Cookie 的 HTTP 客户端
 /// - `url`: playlist 资源（index.png / index.jpg 等）的完整 URL（含 query 认证参数）
 /// - `output_name`: 输出文件名（不含扩展名，调用方负责防撞命名）
-/// - `cancel`: 取消标志（--server 模式传入；CLI 传 None）。在分片与合成检查点快速退出
+/// - `signal`: 任务信号（--server 传取消标志+进度计数；CLI 传 None）。在分片与合成检查点快速退出
 ///
 /// # 返回
 /// 输出文件完整路径
@@ -207,13 +229,9 @@ pub async fn download_png_stream(
     client: Arc<Client>,
     url: &str,
     output_name: &str,
-    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    signal: Option<Arc<TaskSignal>>,
 ) -> Result<PathBuf> {
-    let is_cancelled = || {
-        cancel
-            .as_ref()
-            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-    };
+    let is_cancelled = || signal.as_ref().is_some_and(|s| s.is_cancelled());
 
     // 取消检查点：入口
     if is_cancelled() {
@@ -265,16 +283,13 @@ pub async fn download_png_stream(
         let completed = Arc::clone(&completed);
         let retries = config.download_retries;
         let retry_interval = config.retry_interval;
-        let cancel_task = cancel.clone();
+        let sig = signal.clone();
 
         let task = tokio::spawn(async move {
             let _permit = semaphore.acquire().await.expect("获取信号量失败");
 
             // 取消检查点：任务取消后快速失败，不再发起新分片下载
-            if cancel_task
-                .as_ref()
-                .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-            {
+            if sig.as_ref().is_some_and(|s| s.is_cancelled()) {
                 failed.write().await.push(idx);
                 return;
             }
@@ -299,6 +314,11 @@ pub async fn download_png_stream(
             }
             .await;
 
+            if result.is_ok() {
+                if let Some(s) = &sig {
+                    s.tick();
+                }
+            }
             let done;
             match result {
                 Ok(ts) => {

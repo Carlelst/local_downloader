@@ -28,6 +28,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, Semaphore};
 
 use video_processor::png_stream;
+use video_processor::png_stream::TaskSignal;
 use video_processor::Config;
 
 use crate::{
@@ -67,7 +68,8 @@ struct TaskState {
 #[derive(Clone)]
 struct TaskEntry {
     state: TaskState,
-    cancel: Arc<AtomicBool>,
+    /// 取消标志 + 分片完成计数（与下载管线共享）
+    signal: Arc<TaskSignal>,
 }
 
 type TaskMap = Arc<RwLock<HashMap<String, TaskEntry>>>;
@@ -82,6 +84,33 @@ fn now_ms() -> u64 {
 /// 活动状态：不允许重复入队，也不能直接从列表移除
 fn is_active_state(state: &str) -> bool {
     matches!(state, "queued" | "downloading" | "cancelling")
+}
+
+/// 视频稳定键：host + 路径（去掉 query 与 index/playlist 文件名）。
+/// 同一视频的 auth/exp 轮换只改 query，重复入队/轮询匹配都按此键归一
+fn video_key(url: &str) -> String {
+    const PLAYLIST_FILES: [&str; 5] = [
+        "index.png",
+        "index.jpg",
+        "index.jpeg",
+        "index.webp",
+        "playlist.m3u8",
+    ];
+    match url::Url::parse(url) {
+        Ok(u) => {
+            let path = u.path();
+            let path = match path.rsplit_once('/') {
+                Some((dir, file))
+                    if PLAYLIST_FILES.contains(&file.to_ascii_lowercase().as_str()) =>
+                {
+                    dir.to_string()
+                }
+                _ => path.to_string(),
+            };
+            format!("{}{}", u.host_str().unwrap_or(""), path)
+        }
+        Err(_) => url.split(['?', '#']).next().unwrap_or(url).to_string(),
+    }
 }
 
 /// 启动常驻 HTTP 服务
@@ -221,9 +250,10 @@ async fn handle_download(
         return (false, json_error("url 为空"));
     }
 
-    // 任务表去重：排队/下载中/取消中不重复入队；
-    // done/failed/cancelled 再次提交 = 重新下载（auth 可能已刷新）
-    let cancel_flag = Arc::new(AtomicBool::new(false));
+    // 任务表按视频稳定键去重（auth/exp 轮换不改身份）：排队/下载中/取消中不重复入队；
+    // done/failed/cancelled 再次提交 = 重新下载（刷新为最新 auth 地址）
+    let signal = TaskSignal::new();
+    let key = video_key(&url);
     let output_name = {
         let name = extract_png_video_id(&url);
         let hash = format!("{:x}", md5::compute(&url));
@@ -231,13 +261,13 @@ async fn handle_download(
     };
     {
         let mut map = tasks.write().await;
-        if let Some(existing) = map.get(&url) {
+        if let Some(existing) = map.get(&key) {
             if is_active_state(&existing.state.state) {
-                return (false, json_error("该 URL 已在下载队列中"));
+                return (false, json_error("该视频已在下载队列中"));
             }
         }
         map.insert(
-            url.clone(),
+            key.clone(),
             TaskEntry {
                 state: TaskState {
                     url: url.clone(),
@@ -248,7 +278,7 @@ async fn handle_download(
                     started_at: now_ms(),
                     finished_at: 0,
                 },
-                cancel: Arc::clone(&cancel_flag),
+                signal: Arc::clone(&signal),
             },
         );
     }
@@ -257,7 +287,7 @@ async fn handle_download(
     // 预检失败 = 任务从未真正入队，直接从任务表移除（错误信息由响应带给面板）
     macro_rules! precheck_fail {
         ($msg:expr) => {{
-            tasks.write().await.remove(&url);
+            tasks.write().await.remove(&key);
             return (false, json_error(&$msg));
         }};
     }
@@ -288,7 +318,7 @@ async fn handle_download(
     };
 
     // 记录分片数（面板展示用）
-    if let Some(e) = tasks.write().await.get_mut(&url) {
+    if let Some(e) = tasks.write().await.get_mut(&key) {
         e.state.segments = segment_count;
     }
 
@@ -297,19 +327,20 @@ async fn handle_download(
     let tasks = Arc::clone(tasks);
     let video_slots = Arc::clone(video_slots);
     let task_url = url.clone();
+    let task_key = key.clone();
     tokio::spawn(async move {
         // 等待空闲许可；排队期间被取消则直接出队
         let _permit = tokio::select! {
             p = video_slots.acquire() => p.expect("信号量不应关闭"),
-            _ = wait_cancelled(&cancel_flag) => {
-                finalize_task(&tasks, &task_url, "cancelled", "").await;
+            _ = wait_cancelled(&signal.cancel) => {
+                finalize_task(&tasks, &task_key, "cancelled", "").await;
                 info!("[Server] 排队中任务已取消出队: {}", task_url);
                 return;
             }
         };
 
         // 标记下载中
-        if let Some(e) = tasks.write().await.get_mut(&task_url) {
+        if let Some(e) = tasks.write().await.get_mut(&task_key) {
             e.state.state = "downloading".to_string();
         }
 
@@ -323,7 +354,7 @@ async fn handle_download(
                 client,
                 &task_url,
                 &output_name,
-                Some(Arc::clone(&cancel_flag)),
+                Some(Arc::clone(&signal)),
             )
             .await
             .map(|p| p.display().to_string()),
@@ -339,24 +370,24 @@ async fn handle_download(
                     &config,
                     &download_dir,
                     &temp_dir,
-                    Some(Arc::clone(&cancel_flag)),
+                    Some(Arc::clone(&signal)),
                 )
                 .await
                 .map(|_| format!("{}（输出文件名见上方管线日志）", config.output_directory))
             }
         };
 
-        if cancel_flag.load(Ordering::Relaxed) {
+        if signal.is_cancelled() {
             match result {
                 // 取消请求到达时恰好已全部完成 → 按完成处理，不清理
                 Ok(path) => {
                     info!("[Server] 取消前已完成: {}", path);
-                    finalize_task(&tasks, &task_url, "done", "").await;
+                    finalize_task(&tasks, &task_key, "done", "").await;
                 }
                 Err(_) => {
                     // 后置清理：删除该任务的分段缓存与半成品输出
                     cleanup_task_files(&config, kind, &task_url, &output_name).await;
-                    finalize_task(&tasks, &task_url, "cancelled", "").await;
+                    finalize_task(&tasks, &task_key, "cancelled", "").await;
                     info!("[Server] 任务已取消并清理: {}", task_url);
                 }
             }
@@ -364,12 +395,12 @@ async fn handle_download(
             match result {
                 Ok(path) => {
                     info!("[Server] ✓ 下载完成: {}", path);
-                    finalize_task(&tasks, &task_url, "done", "").await;
+                    finalize_task(&tasks, &task_key, "done", "").await;
                 }
                 Err(e) => {
                     error!("[Server] ✗ 下载失败: {} — {:#}", task_url, e);
                     // 失败保留分段缓存（断点续传价值），仅落终态
-                    finalize_task(&tasks, &task_url, "failed", &format!("{:#}", e)).await;
+                    finalize_task(&tasks, &task_key, "failed", &format!("{:#}", e)).await;
                 }
             }
         }
@@ -464,7 +495,14 @@ async fn handle_status(tasks: &TaskMap) -> String {
     let mut arr = Vec::with_capacity(list.len());
     for e in &list {
         *counts.entry(e.state.state.clone()).or_insert(0) += 1;
-        if let Ok(v) = serde_json::to_value(&e.state) {
+        if let Ok(mut v) = serde_json::to_value(&e.state) {
+            // 注入实时分片进度（done 计数在 signal 里，不落 state 快照）
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "segments_done".to_string(),
+                    serde_json::json!(e.signal.done.load(Ordering::Relaxed)),
+                );
+            }
             arr.push(v);
         }
     }
@@ -477,11 +515,11 @@ async fn handle_cancel(body: &[u8], tasks: &TaskMap) -> (bool, String) {
         Ok(r) => r,
         Err(e) => return (false, json_error(&format!("请求体不是有效 JSON: {}", e))),
     };
-    let url = req.url.trim().to_string();
+    let key = video_key(req.url.trim());
     let mut map = tasks.write().await;
-    match map.get_mut(&url) {
+    match map.get_mut(&key) {
         Some(e) if is_active_state(&e.state.state) => {
-            e.cancel.store(true, Ordering::Relaxed);
+            e.signal.cancel.store(true, Ordering::Relaxed);
             e.state.state = "cancelling".to_string();
             (true, r#"{"ok":true}"#.to_string())
         }
@@ -499,14 +537,14 @@ async fn handle_forget(body: &[u8], tasks: &TaskMap) -> (bool, String) {
         Ok(r) => r,
         Err(e) => return (false, json_error(&format!("请求体不是有效 JSON: {}", e))),
     };
-    let url = req.url.trim().to_string();
+    let key = video_key(req.url.trim());
     let mut map = tasks.write().await;
-    match map.get(&url) {
+    match map.get(&key) {
         Some(e) if is_active_state(&e.state.state) => {
             (false, json_error("任务进行中，请先取消再移除"))
         }
         Some(_) => {
-            map.remove(&url);
+            map.remove(&key);
             (true, r#"{"ok":true}"#.to_string())
         }
         None => (false, json_error("任务不存在")),
@@ -621,7 +659,7 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_forget_status() {
         let tasks: TaskMap = Arc::new(RwLock::new(HashMap::new()));
-        let flag = Arc::new(AtomicBool::new(false));
+        let signal = TaskSignal::new();
         tasks.write().await.insert(
             "u1".to_string(),
             TaskEntry {
@@ -634,14 +672,14 @@ mod tests {
                     started_at: 1,
                     finished_at: 0,
                 },
-                cancel: Arc::clone(&flag),
+                signal: Arc::clone(&signal),
             },
         );
 
         // 取消：置标志 + 状态转 cancelling（幂等，可重复取消）
         let (ok, _) = handle_cancel(br#"{"url":"u1"}"#, &tasks).await;
         assert!(ok);
-        assert!(flag.load(Ordering::Relaxed));
+        assert!(signal.is_cancelled());
         assert_eq!(
             tasks.read().await.get("u1").unwrap().state.state,
             "cancelling"
@@ -674,7 +712,7 @@ mod tests {
                     started_at: 2,
                     finished_at: 3,
                 },
-                cancel: Arc::new(AtomicBool::new(false)),
+                signal: TaskSignal::new(),
             },
         );
         tasks.write().await.insert(
@@ -689,7 +727,7 @@ mod tests {
                     started_at: 3,
                     finished_at: 0,
                 },
-                cancel: Arc::new(AtomicBool::new(false)),
+                signal: TaskSignal::new(),
             },
         );
         let text = handle_status(&tasks).await;
@@ -698,8 +736,9 @@ mod tests {
         assert_eq!(v["counts"]["done"], 1);
         assert_eq!(v["counts"]["downloading"], 1);
         assert_eq!(v["tasks"].as_array().unwrap().len(), 2);
-        // 按开始时间倒序：b(3) 在 a(2) 前
+        // 按开始时间倒序：b(3) 在 a(2) 前；进度字段始终存在
         assert_eq!(v["tasks"][0]["url"], "b");
+        assert_eq!(v["tasks"][0]["segments_done"], 0);
         assert_eq!(v["tasks"][0]["segments"], 9);
     }
 

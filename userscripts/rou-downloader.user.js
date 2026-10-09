@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         rou.video 悬浮球下载器
 // @namespace    https://rou.video/
-// @version      2.1.1
+// @version      2.1.2
 // @description  在 rou.video / missav 播放页右下角显示悬浮球：自动捕获视频地址并暂存为任务（跨页面持久化），点击球打开管理面板：批量发送下载、实时查看服务端进度、取消/重试、手动添加地址
 // @match        https://rou.video/*
 // @match        https://www.rou.video/*
@@ -43,14 +43,40 @@
         try {
             const raw = GM_getValue(TASKS_KEY, '[]');
             const arr = JSON.parse(raw);
-            return Array.isArray(arr) ? arr : [];
+            const list = Array.isArray(arr) ? arr : [];
+            // 一次性迁移：旧版按完整 URL 去重，auth/exp 轮换把同一视频存成了多条 →
+            // 按视频稳定键合并保留最新一条，并把 id 重算为新键（只执行一次）
+            if (!GM_getValue(TASKS_KEY + '_mig2', false)) {
+                GM_setValue(TASKS_KEY + '_mig2', true);
+                const byKey = new Map();
+                for (const t of list) {
+                    const k = videoKey(t.url);
+                    const prev = byKey.get(k);
+                    if (!prev || (t.t || 0) > (prev.t || 0)) {
+                        byKey.set(k, Object.assign({}, t, { id: taskId(k) }));
+                    }
+                }
+                const merged = [...byKey.values()];
+                saveTasks(merged);
+                return merged;
+            }
+            return list;
         } catch (e) { return []; }
     }
     function saveTasks(tasks) {
         try { GM_setValue(TASKS_KEY, JSON.stringify(tasks)); } catch (e) { /* 忽略 */ }
     }
+    // 视频稳定键：host + 路径（去掉 query 与 index/playlist 文件名）。
+    // 同一视频的 auth/exp 轮换只改 query，重复捕获与 /status 匹配都按此键归一
+    // （与服务端 server.rs 的 video_key 逻辑保持一致）
+    function videoKey(url) {
+        try {
+            const u = new URL(url);
+            return u.host + u.pathname.replace(/\/(index|playlist)\.(png|jpg|jpeg|webp|m3u8)$/i, '');
+        } catch (e) { return url.split('?')[0]; }
+    }
     function taskId(url) {
-        // 同一 URL 同一任务：用 URL 稳定哈希做 id（不同页面重复捕获自动合并）
+        // 入参为 videoKey：同一视频同一任务，用稳定哈希做 id
         let h = 0;
         for (let i = 0; i < url.length; i++) { h = (h * 31 + url.charCodeAt(i)) | 0; }
         return 't' + (h >>> 0).toString(36);
@@ -66,13 +92,23 @@
             return t.length > 80 ? t.slice(0, 80) : t;
         } catch (e) { return url.slice(0, 60); }
     }
-    /** 捕获入队：同 URL 去重；返回是否新增/刷新 */
+    /** 捕获入队：按视频稳定键去重（auth/exp 轮换不产生新条目）。
+     *  返回 'new' 新增 / 'refresh' 刷新了已有条目的地址 / false 无变化 */
     function addTask(url, title) {
         const tasks = loadTasks();
-        const id = taskId(url);
+        const key = videoKey(url);
+        const id = taskId(key);
         const existing = tasks.find((t) => t.id === id);
-        // pending/sending 中不重复入队；sent/failed 再次捕获 = 用户想重下（auth 可能已刷新）→ 重置为 pending
-        if (existing && (existing.status === 'pending' || existing.status === 'sending')) return false;
+        if (existing) {
+            // 同一视频重复捕获：仅把地址刷新为最新 auth（旧地址会过期），不新增条目、不重置状态
+            if (existing.url !== url) {
+                existing.url = url;
+                existing.t = Date.now();
+                saveTasks(tasks);
+                return 'refresh';
+            }
+            return false;
+        }
         tasks.unshift({
             id,
             url,
@@ -83,7 +119,7 @@
             err: '',
         });
         saveTasks(tasks.slice(0, 200)); // 上限 200 条防膨胀
-        return true;
+        return 'new';
     }
     function updateTask(id, patch) {
         const tasks = loadTasks();
@@ -112,11 +148,14 @@
         if (!url || typeof url !== 'string') return;
         const clean = url.split('#')[0];
         if (M3U8_RE.test(clean) || PLAYLIST_RE.test(clean)) {
-            const added = addTask(clean, titleFromUrl(clean));
-            if (added) {
+            const r = addTask(clean, titleFromUrl(clean));
+            if (r === 'new') {
                 console.log('[rou-dl] ✓ 已捕获并暂存 (' + source + '):', clean);
                 notifyTasksChanged();
                 reportToTop(clean);
+            } else if (r === 'refresh') {
+                // 同一视频换了新 auth 地址：静默刷新存储，面板打开时自动重绘
+                notifyTasksChanged();
             }
         }
     }
@@ -271,11 +310,12 @@
                    background: rgba(0,0,0,.85); color: #fff; font: 13px/1.5 sans-serif;
                    display: none; box-shadow: 0 4px 16px rgba(0,0,0,.4); word-break: break-all; }
             .panel { position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
-                     width: 460px; max-width: 92vw; max-height: 78vh; z-index: 2147483647;
+                     width: 460px; min-width: 340px; max-width: 92vw; max-height: 78vh;
+                     min-height: 220px; z-index: 2147483647;
                      background: #fff; color: #222; border-radius: 12px;
                      box-shadow: 0 12px 48px rgba(0,0,0,.35);
                      font: 13px/1.5 -apple-system, sans-serif;
-                     display: none; flex-direction: column; overflow: hidden; }
+                     display: none; flex-direction: column; overflow: hidden; resize: both; }
             .panel.open { display: flex; }
             .p-head { padding: 12px 16px; background: #2b5fd9; color: #fff;
                       display: flex; align-items: center; gap: 8px; }
@@ -286,7 +326,9 @@
                         border-bottom: 1px solid #eee; display: flex; gap: 6px; align-items: center; }
             .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
             .dot.ok { background: #43a047; } .dot.bad { background: #e53935; }
-            .p-list { flex: 1; overflow-y: auto; padding: 4px 0; }
+            .p-list { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 0; }
+            .pg { height: 4px; margin-top: 4px; background: #e8eaf0; border-radius: 2px; overflow: hidden; }
+            .pg i { display: block; height: 100%; border-radius: 2px; background: linear-gradient(90deg, #4f8cff, #2b5fd9); transition: width .4s; }
             .item { display: flex; align-items: center; gap: 8px; padding: 8px 16px; border-bottom: 1px solid #f2f2f2; }
             .item:hover { background: #f7f9ff; }
             .item input[type=checkbox] { flex: none; }
@@ -355,7 +397,12 @@
                 ball.classList.remove('has');
             }
         }
-        onTasksChanged = refreshBadge;
+        // 任务变动（捕获/刷新）：刷新角标；面板已打开时同步重绘（捕获后自动出现，无需手点）
+        onTasksChanged = () => {
+            refreshBadge();
+            const input = panel.querySelector('#rd-url');
+            if (panel.classList.contains('open') && shadow.activeElement !== input) renderPanel();
+        };
 
         // ---- 管理面板 ----
         let selected = new Set();
@@ -384,6 +431,14 @@
                 ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
         }
 
+        // 下载中任务的分片进度条（segments_done 由服务端 /status 实时注入）
+        function pgBar(sv) {
+            if (!sv || sv.state !== 'downloading' || !sv.segments) return '';
+            const dn = sv.segments_done || 0;
+            const pct = Math.min(100, Math.round((dn / sv.segments) * 100));
+            return `<div class="pg"><i style="width:${pct}%"></i></div>`;
+        }
+
         function renderPanel() {
             const tasks = loadTasks();
             // 清理已不存在的选中项
@@ -392,15 +447,18 @@
             const stText = { pending: '待下载', sending: '发送中', sent: '已入队', failed: '失败' };
             const ACTIVE_SRV = ['queued', 'downloading', 'cancelling'];
             const rows = tasks.map((t) => {
-                // 已入队任务合并显示服务端实时状态
-                const sv = t.status === 'sent' ? serverTasks[t.url] : null;
+                // 已入队任务合并显示服务端实时状态（按视频稳定键匹配，auth 轮换不影响）
+                const sv = t.status === 'sent' ? serverTasks[videoKey(t.url)] : null;
                 let chip = `<span class="st ${t.status}">${stText[t.status] || t.status}</span>`;
                 let act = '';
                 let metaExtra = t.err ? ' · ' + esc(t.err.slice(0, 60)) : '';
                 if (sv) {
                     const [lbl, cls] = SRV_ST[sv.state] || [sv.state, 'sending'];
                     chip = `<span class="st ${cls}">${lbl}</span>`;
-                    if (sv.segments) metaExtra = ' · ' + sv.segments + ' 分片' + metaExtra;
+                    if (sv.segments) {
+                        const dn = sv.segments_done || 0;
+                        metaExtra = (sv.state === 'downloading' ? ` · ${dn}/${sv.segments} 片` : ' · ' + sv.segments + ' 分片') + metaExtra;
+                    }
                     if (ACTIVE_SRV.includes(sv.state)) {
                         act = '<span class="act" data-act="cancel">取消</span>';
                     } else if (sv.state === 'failed' || sv.state === 'cancelled') {
@@ -417,6 +475,7 @@
                     <div class="info">
                         <div class="t" title="${esc(t.url)}">${esc(t.title)}</div>
                         <div class="meta">${esc(t.host)} · ${fmtTime(t.t)}${metaExtra}</div>
+                        ${pgBar(sv)}
                     </div>
                     ${chip}
                     ${act}
@@ -425,11 +484,16 @@
             });
             // 服务端有、本列表没有的任务（服务重启前的残留 / 其他页面发送的）
             const srvOnly = Object.values(serverTasks)
-                .filter((sv) => !ids.has(taskId(sv.url)))
+                .filter((sv) => !ids.has(taskId(videoKey(sv.url))))
                 .map((sv) => {
                     const [lbl, cls] = SRV_ST[sv.state] || [sv.state, 'sending'];
                     let host = '';
                     try { host = new URL(sv.url).host; } catch (e) { /* 忽略 */ }
+                    let segTxt = '';
+                    if (sv.segments) {
+                        const dn = sv.segments_done || 0;
+                        segTxt = sv.state === 'downloading' ? ` · ${dn}/${sv.segments} 片` : ' · ' + sv.segments + ' 分片';
+                    }
                     const act = ACTIVE_SRV.includes(sv.state)
                         ? '<span class="act" data-act="cancel">取消</span>'
                         : ((sv.state === 'failed' || sv.state === 'cancelled')
@@ -443,7 +507,8 @@
                     <input type="checkbox" disabled>
                     <div class="info">
                         <div class="t" title="${esc(sv.url)}">${esc(sv.name || sv.url.slice(0, 60))}</div>
-                        <div class="meta">${esc(host)}${sv.segments ? ' · ' + sv.segments + ' 分片' : ''}${sv.error ? ' · ' + esc(sv.error.slice(0, 60)) : ''}</div>
+                        <div class="meta">${esc(host)}${segTxt}${sv.error ? ' · ' + esc(sv.error.slice(0, 60)) : ''}</div>
+                        ${pgBar(sv)}
                     </div>
                     <span class="st ${cls}">${lbl}</span>
                     ${act}
@@ -497,7 +562,7 @@
                 showTip(r.ok ? '已重新入队下载' : '重试失败：' + r.msg, r.ok ? '#81c784' : '#ffb74d');
                 pollStatus();
             } else if (act === 'resend') {
-                updateTask(taskId(url), { status: 'pending', err: '' });
+                updateTask(taskId(videoKey(url)), { status: 'pending', err: '' });
                 renderPanel();
             } else if (act === 'forget') {
                 GM_xmlhttpRequest({
@@ -516,11 +581,12 @@
             if (!raw) return;
             const url = raw.split('#')[0];
             if (!/^https?:\/\//i.test(url)) { showTip('请输入 http(s):// 开头的完整地址', '#ffb74d'); return; }
-            if (addTask(url, titleFromUrl(url))) {
+            const r = addTask(url, titleFromUrl(url));
+            if (r) {
                 inp.value = '';
                 notifyTasksChanged();
                 renderPanel();
-                showTip('已添加，勾选后点"下载选中"', '#81c784');
+                showTip(r === 'new' ? '已添加，勾选后点"下载选中"' : '该视频已在列表中，已刷新为最新地址', '#81c784');
             } else {
                 showTip('该地址已在任务列表中', '#ffb74d');
             }
@@ -582,7 +648,7 @@
                         const d = JSON.parse(resp.responseText);
                         if (d && d.ok) {
                             const map = {};
-                            (d.tasks || []).forEach((t) => { map[t.url] = t; });
+                            (d.tasks || []).forEach((t) => { map[videoKey(t.url)] = t; });
                             serverTasks = map;
                             serverCounts = d.counts || {};
                             const snap = JSON.stringify([serverTasks, serverCounts]);
