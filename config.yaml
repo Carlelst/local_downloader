@@ -8,10 +8,10 @@ chunk_size: 2097152         # 增加下载块大小到 2MB
 output_directory: "./downloads"  # 输出文件的目录
 video_format: "mp4"              # 输出视频格式，如 mp4, mkv, flv
 video_codec: "copy"              # 视频编码，通常使用 copy 以避免重新编码
-audio_codec: "aac"               # 音频编码，如 aac, copy, mp3
+audio_codec: "copy"               # TS 音轨本就是 AAC，copy 避免 CPU 重编码
 
 # 系统配置
-log_level: "debug"                # 日志级别，可选："debug", "info", "warn", "error"
+log_level: "info"                 # 日志级别，可选："debug", "info", "warn", "error"
 buffer_size: 8388608             # 缓冲区大小（字节），默认 8MB
 validate_segments: false        # 禁用片段验证以加快启动
 use_hw_accel: true             # 启用硬件加速
@@ -30,16 +30,20 @@ referers:
   # eporner 对未知 Referer 会 302 到 na.mp4 (Not Available) 导致 404，
   # 必须带自身域名 Referer 或不带
   eporner.com: "https://www.eporner.com/"
+  # rou.video 家族伪装流 CDN：节点域名常变（fuzb14/gokj68/monb18/rn245/cexd14... 均为 *.xyz）
+  # 通配符 *.xyz 覆盖所有 xyz 节点；如遇需不同 Referer 的 xyz 站点，用具体域名条目覆盖（优先级更高）
+  "*.xyz": "https://rou.video/"
 
 # Referer 不变，cookie 已不需要（curl-cffi 自动处理 Cloudflare TLS 指纹）
 
 
 m3u8_urls:
-- https://dash-s19-n50-nl-cdn.eporner.com/hls/srv6/18096225-1080p.mp4/index-v1-a1.m3u8?hash=WfStIHNNS3k9aONm3Q0UkQ&expires=1791562103&ip=141.11.219.12&id=18096225
-- https://dash-s10-n50-de-cdn.eporner.com/hls/srv5/14464693-1080p-av1.mp4/index-v1-a1.m3u8?hash=x1VuOBHV81lpYdjq-BMY9w&expires=1791562447&ip=141.11.219.12&id=14464693
-- https://dash-s3-c50-fr-cdn.eporner.com/hls/srv6/12379045-1080p.mp4/index-v1-a1.m3u8?hash=fFmMikaeUFKiJwj296Fa1A&expires=1791562497&ip=141.11.219.12&id=12379045
-- 
 
-
-
+# PNG 伪装流（rou.video 风格）：playlist 和分片都伪装成 PNG，藏在 roUd chunk 中。
+# 填入 index.png 的完整 URL（含 ?v=&exp=&auth= 认证参数），
+# 程序会自动解出 playlist（分片为多个节点的绝对 URL，每片带独立 auth），
+# 并发下载全部分片并合成 mp4。auth 有时效（exp 参数），过期后需重新抓取。
+png_urls:
+# - https://kamq40.xyz/hls/<video_id>/<video_id>-720/index.png?v=6&exp=<unix时间戳>&auth=<签名>
+# 也可只填 index.png 播放页地址；auth 过期后重新抓取即可
 

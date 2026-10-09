@@ -67,11 +67,12 @@ type ParseResult = Result<(
 )>;
 
 // 内部实现函数，添加递归深度参数防止无限递归
+// 手写 Box<dyn Future> 处理递归；+ Send 使 future 可跨 tokio::spawn 使用（server 复用管线需要）
 fn parse_m3u8_with_depth<'a>(
     m3u8_url: &'a str,
     client: &'a Client,
     depth: usize,
-) -> Pin<Box<dyn Future<Output = ParseResult> + 'a>> {
+) -> Pin<Box<dyn Future<Output = ParseResult> + Send + 'a>> {
     Box::pin(async move {
         // 防止过深递归
         if depth > 5 {

@@ -364,6 +364,7 @@ mod tests {
     async fn test_config_conversion() {
         let config = Config {
             m3u8_urls: vec![],
+            png_urls: vec![],
             max_concurrent_downloads: 4,
             download_retries: 3,
             segment_timeout: 30,

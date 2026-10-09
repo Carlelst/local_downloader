@@ -211,9 +211,11 @@ pub async fn start_ffmpeg(
     }
 
     // 优化输出
-    cmd.arg("-movflags")
-        .arg("+faststart")
-        .arg("-shortest")
+    // 不用 +faststart：它会在写完后把 moov box 移到文件头，需要二次全文件重写，
+    // 200MB 视频实测多花数分钟。本工具产出的是本地完整文件（先下载完再 remux），
+    // moov 在尾部对本地播放（VLC/IINA/mpv/浏览器 file://）无影响；
+    // 若需要网页边下边播，在输出命令后手动执行 ffmpeg -i in.mp4 -c copy -movflags +faststart out.mp4
+    cmd.arg("-shortest")
         .arg(&output_path_str);
 
     // 设置日志级别（ffmpeg 的 info 会直接向终端刷 progress 行，混入日志输出，故最高只给 warning）

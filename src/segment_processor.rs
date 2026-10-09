@@ -112,7 +112,7 @@ pub fn media_sequence_iv(seq: u64) -> Vec<u8> {
 /// 校验分片数据签名：TS 以 0x47 同步字节开头；fMP4 段是 ISO-BMFF box 结构
 /// （box header = 4 字节大端 size + 4 字节 ASCII type，如 moof/sidx/styp/emsg，
 /// 不同 CDN 首个 box 不固定，因此做结构校验而非枚举类型）
-fn is_valid_segment_signature(data: &[u8]) -> bool {
+pub(crate) fn is_valid_segment_signature(data: &[u8]) -> bool {
     if data.is_empty() {
         return false;
     }

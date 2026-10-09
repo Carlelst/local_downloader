@@ -92,6 +92,7 @@ pub mod decryptor;
 pub mod downloader;
 pub mod ffmpeg;
 pub mod m3u8_parser;
+pub mod png_stream;
 pub mod segment_processor;
 
 // 重新导出模块中的公共函数，方便外部调用
@@ -152,10 +153,16 @@ use std::fs::File;
 /// println!("Max concurrent downloads: {}", config.max_concurrent_downloads);
 /// println!("Output directory: {}", config.output_directory);
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     /// List of M3U8 URLs to process
+    #[serde(default)]
     pub m3u8_urls: Vec<String>,
+    /// PNG 伪装流 URL 列表（rou.video 风格：视频分片伪装成 PNG 图片，
+    /// 分片数据藏在自定义 roUd chunk 中；填入任一分片或 index.png 的 URL 即可，
+    /// 程序会自动探测同目录下 C-000.png 起的分片序列并下载合并）
+    #[serde(default)]
+    pub png_urls: Vec<String>,
     /// Maximum number of concurrent downloads (default: varies by system)
     pub max_concurrent_downloads: usize,
     /// Number of retry attempts for failed downloads (default: 3)
@@ -294,6 +301,9 @@ pub fn load_config() -> Result<Config> {
     let mut config: Config = from_reader(file).context("解析配置文件失败")?;
     // 防御：从浏览器 DevTools 复制 URL 时可能带入反引号，导致请求 URL 非法
     for url in &mut config.m3u8_urls {
+        *url = url.trim_matches('`').trim().to_string();
+    }
+    for url in &mut config.png_urls {
         *url = url.trim_matches('`').trim().to_string();
     }
     config.referer = config.referer.trim_matches('`').trim().to_string();

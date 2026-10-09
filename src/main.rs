@@ -20,6 +20,8 @@ use video_processor::{
     segment_processor::{media_sequence_iv, process_segment},
 };
 
+mod server;
+
 /// 保存断点续传元数据（已下载分片索引列表），供正常完成与中途失败两条路径复用
 async fn save_checkpoint(downloaded: &RwLock<HashSet<usize>>, metadata_path: &Path) {
     let list: Vec<usize> = downloaded.read().await.iter().copied().collect();
@@ -98,6 +100,31 @@ fn is_resolution(s: &str) -> bool {
     false
 }
 
+// 从 PNG 伪装流 URL 提取视频 ID（rou.video 风格）
+// 最后一段是伪装文件名（index.png / index.jpg / C-000.jpg 等），无语义，
+// 从后往前跳过图片扩展名段和分辨率段，取第一个有语义的目录段
+fn extract_png_video_id(url: &str) -> String {
+    if let Ok(parsed) = url::Url::parse(url) {
+        let segments: Vec<&str> = parsed
+            .path_segments()
+            .map(|s| s.filter(|x| !x.is_empty()).collect())
+            .unwrap_or_default();
+        for seg in segments.iter().rev() {
+            let lower = seg.to_ascii_lowercase();
+            let is_image_file = [".png", ".jpg", ".jpeg", ".webp", ".gif"]
+                .iter()
+                .any(|ext| lower.ends_with(ext));
+            if is_image_file || is_resolution(&lower) {
+                continue;
+            }
+            return sanitize_filename(seg);
+        }
+    }
+    // 回退到 MD5
+    let url_hash = format!("{:x}", md5::compute(url));
+    format!("png_{}", &url_hash[..10])
+}
+
 // 判断字符串是否是 UUID 格式
 fn is_uuid(s: &str) -> bool {
     let parts: Vec<&str> = s.split('-').collect();
@@ -120,94 +147,178 @@ fn sanitize_filename(name: &str) -> String {
         .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_is_resolution_bitrate_segments() {
-        // 码率段（vostrely.com 风格 /2000kb/hls/）
-        assert!(is_resolution("2000kb"));
-        assert!(is_resolution("3000kb"));
-        assert!(is_resolution("2000kbps"));
-        assert!(is_resolution("800mbps"));
-        // 非纯数字前缀不是码率
-        assert!(!is_resolution("hZ08wQf1kb"));
+// 根据 URL 获取对应的 Cookie 字符串
+fn get_cookie_for_url(url: &str, config: &video_processor::Config) -> String {
+    if let Ok(parsed) = url::Url::parse(url) {
+        if let Some(host) = parsed.host_str() {
+            // 先尝试完整匹配域名
+            if let Some(cookie) = config.cookies.get(host) {
+                return cookie.clone();
+            }
+            // 尝试匹配顶级域名
+            let parts: Vec<&str> = host.split('.').collect();
+            if parts.len() >= 2 {
+                let domain = format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1]);
+                if let Some(cookie) = config.cookies.get(&domain) {
+                    return cookie.clone();
+                }
+            }
+        }
     }
-
-    #[test]
-    fn test_is_resolution_video_resolutions() {
-        assert!(is_resolution("720p"));
-        assert!(is_resolution("1080p"));
-        assert!(is_resolution("4k"));
-        assert!(is_resolution("1920x1080"));
-        assert!(!is_resolution("720x"));
-        assert!(!is_resolution("p720"));
-    }
-
-    #[test]
-    fn test_is_resolution_normal_names() {
-        assert!(!is_resolution("hZ08wQf1"));
-        assert!(!is_resolution("index"));
-        assert!(!is_resolution("hls"));
-        assert!(!is_resolution(""));
-    }
-
-    #[test]
-    fn test_extract_video_id_vostrely() {
-        // 码率段 2000kb 应被跳过，命中 hash 段
-        let id = extract_video_id("https://vostrely.com/20260516/hZ08wQf1/2000kb/hls/index.m3u8");
-        assert_eq!(id, "hZ08wQf1");
-    }
-
-    #[test]
-    fn test_extract_video_id_surrit_uuid() {
-        let id = extract_video_id(
-            "https://surrit.com/2e997f15-8b5e-4a83-9210-3d3e4dfe09a3/720p/video.m3u8",
-        );
-        assert_eq!(id, "2e997f15-8b5e-4a83-9210-3d3e4dfe09a3");
-    }
-
-    #[test]
-    fn test_extract_video_id_phncdn_style() {
-        // index-v1-a1.m3u8 被跳过；720P_4000K_414878711.mp4 非纯分辨率标记，
-        // 从后往前第一个命中
-        let id = extract_video_id(
-            "https://ev-h.phncdn.com/hls/videos/202209/02/414878711/720P_4000K_414878711.mp4/index-v1-a1.m3u8",
-        );
-        assert_eq!(id, "720P_4000K_414878711.mp4");
-    }
-
-    #[test]
-    fn test_extract_video_id_md5_fallback() {
-        // 无有效段时回退 MD5 前缀
-        let id = extract_video_id("https://example.com/master.m3u8");
-        assert!(id.starts_with("cf_"));
-        assert_eq!(id.len(), 13);
-    }
+    String::new()
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let start_time = Instant::now();
-    let mut config = video_processor::load_config()?;
+// 创建 HTTP client 的辅助函数
+fn create_http_client(referer: &str, cookie: &str, timeout_secs: u64) -> Result<Client> {
+    // 读取系统代理设置（macOS 系统偏好设置 -> 网络 -> 代理）
+    // reqwest 默认会读取 HTTP_PROXY/HTTPS_PROXY 环境变量，
+    // 但在 macOS 上系统代理不会自动写入环境变量，需要手动处理
+    let mut builder = Client::builder()
+        // 总超时只作兜底（慢速代理下大分片需要较长时间），
+        // 真正的停滞检测由 stream_download 的逐块超时负责
+        .timeout(Duration::from_secs((timeout_secs * 10).max(120)))
+        .connect_timeout(Duration::from_secs(15))
+        .pool_max_idle_per_host(10)
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36");
 
-    // 初始化日志
-    Builder::new()
-        .filter(None, parse_log_level(&config.log_level))
-        .format(|buf, record| {
-            writeln!(
-                buf,
-                "[{} {}] {}",
-                Local::now().format("%Y-%m-%d %H:%M:%S"),
-                record.level(),
-                record.args()
-            )
+    // 检查系统代理环境变量
+    let proxy_url = std::env::var("HTTPS_PROXY")
+        .or_else(|_| std::env::var("https_proxy"))
+        .or_else(|_| std::env::var("HTTP_PROXY"))
+        .or_else(|_| std::env::var("http_proxy"))
+        .or_else(|_| std::env::var("ALL_PROXY"))
+        .or_else(|_| std::env::var("all_proxy"))
+        .ok();
+
+    // 如果环境变量没有设置，尝试读取 macOS 系统代理
+    let proxy_url = if proxy_url.is_none() {
+        #[cfg(target_os = "macos")]
+        {
+            // 从 scutil 读取系统代理（scutil 输出格式： "<Key> : <Value>"）
+            if let Ok(output) = std::process::Command::new("scutil").arg("--proxy").output() {
+                let s = String::from_utf8_lossy(&output.stdout);
+                // 精确按 key 解析，避免 "HTTPProxy" 前缀误匹配 "HTTPSProxy"
+                let mut http_proxy: Option<String> = None;
+                let mut http_port: Option<String> = None;
+                let mut http_enabled = false;
+                let mut https_enabled = false;
+
+                fn split_kv(line: &str) -> Option<(&str, &str)> {
+                    // 接受 " : " 或 ":" 分隔
+                    let line = line.trim();
+                    if let Some(idx) = line.find(" : ") {
+                        Some((line[..idx].trim(), line[idx + 3..].trim()))
+                    } else if let Some(idx) = line.find(':') {
+                        Some((line[..idx].trim(), line[idx + 1..].trim()))
+                    } else {
+                        None
+                    }
+                }
+
+                for line in s.lines() {
+                    let Some((key, value)) = split_kv(line) else {
+                        continue;
+                    };
+                    match key {
+                        "HTTPProxy" => {
+                            if !value.is_empty() {
+                                http_proxy = Some(value.to_string());
+                            }
+                        }
+                        "HTTPPort" => {
+                            if !value.is_empty() {
+                                http_port = Some(value.to_string());
+                            }
+                        }
+                        "HTTPEnable" => http_enabled = value == "1",
+                        "HTTPSEnable" => https_enabled = value == "1",
+                        _ => {}
+                    }
+                }
+
+                // 如果 HTTPS 代理开启，使用它；否则尝试 HTTP 代理
+                let use_proxy = https_enabled || http_enabled;
+                if use_proxy {
+                    if let (Some(host), Some(port)) = (http_proxy, http_port) {
+                        debug!("检测到系统代理: {}:{}", host, port);
+                        Some(format!("http://{}:{}", host, port))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    } else {
+        proxy_url
+    };
+
+    if let Some(url) = proxy_url {
+        debug!("使用代理: {}", url);
+        match reqwest::Proxy::all(&url) {
+            // 回环地址（本地下载服务/本地测试服务器）必须直连，否则代理会拦截导致请求失败
+            Ok(proxy) => {
+                builder = builder.proxy(
+                    proxy.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1,::1")),
+                );
+            }
+            Err(e) => {
+                warn!("代理配置失败: {}，继续不使用代理", e);
+            }
+        }
+    }
+
+    builder
+        .default_headers({
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert("Accept", "*/*".parse().unwrap());
+            headers.insert(
+                "Accept-Language",
+                "zh-CN,zh;q=0.9,en;q=0.8".parse().unwrap(),
+            );
+            // 注意：不要手动设置 Accept-Encoding，让 reqwest 自动处理 gzip/deflate/br 解压
+            headers.insert("Connection", "keep-alive".parse().unwrap());
+            // 注意：不要发送 Sec-Fetch-* 头！
+            // eporner 等 CDN 会将 Sec-Fetch-Site: cross-site 视为盗链，
+            // 302 重定向到 na.mp4 导致 404；不发送这些头则畅通
+            headers.insert("sec-ch-ua-platform", "macOS".parse().unwrap());
+            headers.insert(
+                "sec-ch-ua",
+                "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\""
+                    .parse()
+                    .unwrap(),
+            );
+            headers.insert("sec-ch-ua-mobile", "?0".parse().unwrap());
+            headers.insert("Referer", referer.parse().unwrap());
+            // 如果有自定义 Cookie（用于绕过 Cloudflare），添加 Cookie 头
+            if !cookie.is_empty() {
+                if let Ok(cookie_value) = cookie.parse() {
+                    headers.insert("Cookie", cookie_value);
+                }
+            }
+            headers
         })
-        .init();
+        .build()
+        .map_err(|e| anyhow!("创建HTTP客户端失败: {}", e))
+}
 
-    info!("加载配置: {:?}", config);
-    info!("使用并发下载数: {}", config.max_concurrent_downloads);
+// 批量处理 M3U8 URL（CLI 与 --server 共用的下载管线，含断点续传/AES 解密/CF bypass）
+// 单条 URL 失败只跳过自身，不中断批量
+pub async fn process_m3u8_batch(
+    urls: &[String],
+    config: &video_processor::Config,
+    download_dir: &Path,
+    temp_dir: &Path,
+) -> Result<()> {
+    // 转为 owned，便于下方 spawn 的下载任务捕获（&引用不能逃逸到 'static 任务）
+    let config = config.clone();
 
     // 增加自适应并发控制
     let adaptive_concurrency = Arc::new(RwLock::new(config.max_concurrent_downloads));
@@ -221,240 +332,7 @@ async fn main() -> Result<()> {
         config.buffer_size
     };
 
-    info!("使用缓冲区大小: {} 字节", buffer_size);
-
-    // 检查是否需要清除缓存
-    if std::env::args().any(|arg| arg == "--clear-cache") {
-        info!("清除所有下载缓存...");
-        let download_dir = Path::new(&config.output_directory);
-        let temp_dir = download_dir.join("temp");
-        if temp_dir.exists() {
-            match tokio::fs::remove_dir_all(&temp_dir).await {
-                Ok(_) => info!("缓存目录已清除"),
-                Err(e) => warn!("清除缓存失败: {}", e),
-            }
-            match tokio::fs::create_dir_all(&temp_dir).await {
-                Ok(_) => info!("已创建新的缓存目录"),
-                Err(e) => warn!("创建缓存目录失败: {}", e),
-            }
-        }
-    }
-
-    // 检查是否指定了比特率
-    let mut global_referer = config.referer.clone();
-    for arg in std::env::args() {
-        if arg.starts_with("--bitrate=") {
-            let bitrate = arg.split('=').nth(1).unwrap_or("2M").to_string();
-            info!("使用命令行指定的视频比特率: {}", bitrate);
-            config.video_bitrate = Some(bitrate);
-        } else if arg == "--copy" {
-            // 强制使用copy模式
-            info!("使用copy模式，不重新编码视频");
-            config.video_codec = "copy".to_string();
-            config.use_hw_accel = false;
-        } else if arg == "--no-hw" {
-            // 禁用硬件加速
-            info!("禁用硬件加速");
-            config.use_hw_accel = false;
-        } else if arg.starts_with("--referer=") {
-            global_referer = arg.split('=').nth(1).unwrap_or(&global_referer).to_string();
-            info!("使用命令行指定的全局 Referer: {}", global_referer);
-        }
-    }
-
-    // 根据 URL 域名获取对应的 Referer
-    fn get_referer_for_url(url: &str, config: &video_processor::Config) -> String {
-        // 尝试从 URL 中提取域名
-        if let Ok(parsed) = url::Url::parse(url) {
-            if let Some(host) = parsed.host_str() {
-                // 先尝试完整匹配域名
-                if let Some(referer) = config.referers.get(host) {
-                    return referer.clone();
-                }
-                // 尝试匹配顶级域名（如 surrit.com）
-                let parts: Vec<&str> = host.split('.').collect();
-                if parts.len() >= 2 {
-                    let domain = format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1]);
-                    if let Some(referer) = config.referers.get(&domain) {
-                        return referer.clone();
-                    }
-                }
-            }
-        }
-        // 回退到全局默认 referer
-        config.referer.clone()
-    }
-
-    // 根据 URL 获取对应的 Cookie 字符串
-    fn get_cookie_for_url(url: &str, config: &video_processor::Config) -> String {
-        if let Ok(parsed) = url::Url::parse(url) {
-            if let Some(host) = parsed.host_str() {
-                // 先尝试完整匹配域名
-                if let Some(cookie) = config.cookies.get(host) {
-                    return cookie.clone();
-                }
-                // 尝试匹配顶级域名
-                let parts: Vec<&str> = host.split('.').collect();
-                if parts.len() >= 2 {
-                    let domain = format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1]);
-                    if let Some(cookie) = config.cookies.get(&domain) {
-                        return cookie.clone();
-                    }
-                }
-            }
-        }
-        String::new()
-    }
-
-    // 创建 HTTP client 的辅助函数
-    fn create_http_client(referer: &str, cookie: &str, timeout_secs: u64) -> Result<Client> {
-        // 读取系统代理设置（macOS 系统偏好设置 -> 网络 -> 代理）
-        // reqwest 默认会读取 HTTP_PROXY/HTTPS_PROXY 环境变量，
-        // 但在 macOS 上系统代理不会自动写入环境变量，需要手动处理
-        let mut builder = Client::builder()
-            // 总超时只作兜底（慢速代理下大分片需要较长时间），
-            // 真正的停滞检测由 stream_download 的逐块超时负责
-            .timeout(Duration::from_secs((timeout_secs * 10).max(120)))
-            .connect_timeout(Duration::from_secs(15))
-            .pool_max_idle_per_host(10)
-            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36");
-
-        // 检查系统代理环境变量
-        let proxy_url = std::env::var("HTTPS_PROXY")
-            .or_else(|_| std::env::var("https_proxy"))
-            .or_else(|_| std::env::var("HTTP_PROXY"))
-            .or_else(|_| std::env::var("http_proxy"))
-            .or_else(|_| std::env::var("ALL_PROXY"))
-            .or_else(|_| std::env::var("all_proxy"))
-            .ok();
-
-        // 如果环境变量没有设置，尝试读取 macOS 系统代理
-        let proxy_url = if proxy_url.is_none() {
-            #[cfg(target_os = "macos")]
-            {
-                // 从 scutil 读取系统代理（scutil 输出格式： "<Key> : <Value>"）
-                if let Ok(output) = std::process::Command::new("scutil").arg("--proxy").output() {
-                    let s = String::from_utf8_lossy(&output.stdout);
-                    // 精确按 key 解析，避免 "HTTPProxy" 前缀误匹配 "HTTPSProxy"
-                    let mut http_proxy: Option<String> = None;
-                    let mut http_port: Option<String> = None;
-                    let mut http_enabled = false;
-                    let mut https_enabled = false;
-
-                    fn split_kv(line: &str) -> Option<(&str, &str)> {
-                        // 接受 " : " 或 ":" 分隔
-                        let line = line.trim();
-                        if let Some(idx) = line.find(" : ") {
-                            Some((line[..idx].trim(), line[idx + 3..].trim()))
-                        } else if let Some(idx) = line.find(':') {
-                            Some((line[..idx].trim(), line[idx + 1..].trim()))
-                        } else {
-                            None
-                        }
-                    }
-
-                    for line in s.lines() {
-                        let Some((key, value)) = split_kv(line) else {
-                            continue;
-                        };
-                        match key {
-                            "HTTPProxy" => {
-                                if !value.is_empty() {
-                                    http_proxy = Some(value.to_string());
-                                }
-                            }
-                            "HTTPPort" => {
-                                if !value.is_empty() {
-                                    http_port = Some(value.to_string());
-                                }
-                            }
-                            "HTTPEnable" => http_enabled = value == "1",
-                            "HTTPSEnable" => https_enabled = value == "1",
-                            _ => {}
-                        }
-                    }
-
-                    // 如果 HTTPS 代理开启，使用它；否则尝试 HTTP 代理
-                    let use_proxy = https_enabled || http_enabled;
-                    if use_proxy {
-                        if let (Some(host), Some(port)) = (http_proxy, http_port) {
-                            debug!("检测到系统代理: {}:{}", host, port);
-                            Some(format!("http://{}:{}", host, port))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                None
-            }
-        } else {
-            proxy_url
-        };
-
-        if let Some(url) = proxy_url {
-            debug!("使用代理: {}", url);
-            match reqwest::Proxy::all(&url) {
-                Ok(proxy) => {
-                    builder = builder.proxy(proxy);
-                }
-                Err(e) => {
-                    warn!("代理配置失败: {}，继续不使用代理", e);
-                }
-            }
-        }
-
-        builder
-            .default_headers({
-                let mut headers = reqwest::header::HeaderMap::new();
-                headers.insert("Accept", "*/*".parse().unwrap());
-                headers.insert(
-                    "Accept-Language",
-                    "zh-CN,zh;q=0.9,en;q=0.8".parse().unwrap(),
-                );
-                // 注意：不要手动设置 Accept-Encoding，让 reqwest 自动处理 gzip/deflate/br 解压
-                headers.insert("Connection", "keep-alive".parse().unwrap());
-                // 注意：不要发送 Sec-Fetch-* 头！
-                // eporner 等 CDN 会将 Sec-Fetch-Site: cross-site 视为盗链，
-                // 302 重定向到 na.mp4 导致 404；不发送这些头则畅通
-                headers.insert("sec-ch-ua-platform", "macOS".parse().unwrap());
-                headers.insert(
-                    "sec-ch-ua",
-                    "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\""
-                        .parse()
-                        .unwrap(),
-                );
-                headers.insert("sec-ch-ua-mobile", "?0".parse().unwrap());
-                headers.insert("Referer", referer.parse().unwrap());
-                // 如果有自定义 Cookie（用于绕过 Cloudflare），添加 Cookie 头
-                if !cookie.is_empty() {
-                    if let Ok(cookie_value) = cookie.parse() {
-                        headers.insert("Cookie", cookie_value);
-                    }
-                }
-                headers
-            })
-            .build()
-            .map_err(|e| anyhow!("创建HTTP客户端失败: {}", e))
-    }
-
-    // 确保输出目录存在
-    let download_dir = Path::new(&config.output_directory);
-    if !download_dir.exists() {
-        create_dir_all(download_dir).await?;
-    }
-    let temp_dir = download_dir.join("temp");
-    if !temp_dir.exists() {
-        create_dir_all(&temp_dir).await?;
-    }
-
-    for (i, m3u8_url) in config.m3u8_urls.iter().enumerate() {
+    for (i, m3u8_url) in urls.iter().enumerate() {
         if m3u8_url.trim().is_empty() {
             continue;
         }
@@ -488,12 +366,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        debug!(
-            "处理 M3U8 文件 [{}/{}]: {}",
-            i + 1,
-            config.m3u8_urls.len(),
-            m3u8_url
-        );
+        debug!("处理 M3U8 文件 [{}/{}]: {}", i + 1, urls.len(), m3u8_url);
 
         // 根据当前 URL 的域名获取对应的 Referer 和 Cookie，并创建专用的 client
         let url_referer = get_referer_for_url(m3u8_url, &config);
@@ -1066,6 +939,345 @@ async fn main() -> Result<()> {
             }
         } else {
             error!("FFmpeg 处理失败: {}", output_file);
+        }
+    }
+    Ok(())
+}
+
+// 根据 URL 域名获取对应的 Referer
+// 匹配优先级（从高到低）：
+//   1. referers 中与完整 host 精确匹配（如 v.rn245.xyz）
+//   2. referers 中与顶级域（TLD+1，如 rn245.xyz）匹配
+//   3. referers 中通配符条目匹配（如 *.xyz 命中任意 xxx.xyz 域名）
+//   4. 全局默认 referer
+// 通配条目优先级最低，可被上面任何更具体的条目覆盖
+fn get_referer_for_url(url: &str, config: &video_processor::Config) -> String {
+    // 尝试从 URL 中提取域名
+    if let Ok(parsed) = url::Url::parse(url) {
+        if let Some(host) = parsed.host_str() {
+            // 1. 完整匹配域名
+            if let Some(referer) = config.referers.get(host) {
+                return referer.clone();
+            }
+            // 2. 匹配顶级域名（如 surrit.com）
+            let parts: Vec<&str> = host.split('.').collect();
+            if parts.len() >= 2 {
+                let domain = format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1]);
+                if let Some(referer) = config.referers.get(&domain) {
+                    return referer.clone();
+                }
+            }
+            // 3. 通配符条目（如 *.xyz：命中任意 <label>.xyz）
+            for (pattern, referer) in config.referers.iter() {
+                if let Some(suffix) = pattern.strip_prefix("*.") {
+                    if !suffix.is_empty()
+                        && host.len() > suffix.len() + 1
+                        && host.ends_with(suffix)
+                        && host.ends_with(&format!(".{}", suffix))
+                    {
+                        return referer.clone();
+                    }
+                }
+            }
+        }
+    }
+    // 4. 回退到全局默认 referer
+    config.referer.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_resolution_bitrate_segments() {
+        // 码率段（vostrely.com 风格 /2000kb/hls/）
+        assert!(is_resolution("2000kb"));
+        assert!(is_resolution("3000kb"));
+        assert!(is_resolution("2000kbps"));
+        assert!(is_resolution("800mbps"));
+        // 非纯数字前缀不是码率
+        assert!(!is_resolution("hZ08wQf1kb"));
+    }
+
+    #[test]
+    fn test_is_resolution_video_resolutions() {
+        assert!(is_resolution("720p"));
+        assert!(is_resolution("1080p"));
+        assert!(is_resolution("4k"));
+        assert!(is_resolution("1920x1080"));
+        assert!(!is_resolution("720x"));
+        assert!(!is_resolution("p720"));
+    }
+
+    #[test]
+    fn test_is_resolution_normal_names() {
+        assert!(!is_resolution("hZ08wQf1"));
+        assert!(!is_resolution("index"));
+        assert!(!is_resolution("hls"));
+        assert!(!is_resolution(""));
+    }
+
+    #[test]
+    fn test_extract_video_id_vostrely() {
+        // 码率段 2000kb 应被跳过，命中 hash 段
+        let id = extract_video_id("https://vostrely.com/20260516/hZ08wQf1/2000kb/hls/index.m3u8");
+        assert_eq!(id, "hZ08wQf1");
+    }
+
+    #[test]
+    fn test_extract_video_id_surrit_uuid() {
+        let id = extract_video_id(
+            "https://surrit.com/2e997f15-8b5e-4a83-9210-3d3e4dfe09a3/720p/video.m3u8",
+        );
+        assert_eq!(id, "2e997f15-8b5e-4a83-9210-3d3e4dfe09a3");
+    }
+
+    #[test]
+    fn test_extract_video_id_phncdn_style() {
+        // index-v1-a1.m3u8 被跳过；720P_4000K_414878711.mp4 非纯分辨率标记，
+        // 从后往前第一个命中
+        let id = extract_video_id(
+            "https://ev-h.phncdn.com/hls/videos/202209/02/414878711/720P_4000K_414878711.mp4/index-v1-a1.m3u8",
+        );
+        assert_eq!(id, "720P_4000K_414878711.mp4");
+    }
+
+    /// 测试辅助：从 YAML 片段构造 Config（填齐必填字段）
+    fn make_config(yaml: &str) -> video_processor::Config {
+        serde_yaml::from_str(yaml).expect("测试 YAML 解析失败")
+    }
+
+    #[test]
+    fn test_get_referer_for_url_wildcard() {
+        let config = make_config(
+            r#"
+m3u8_urls: []
+max_concurrent_downloads: 1
+download_retries: 1
+segment_timeout: 10
+retry_interval: 1
+referer: "https://default.com/"
+referers:
+  "*.xyz": "https://rou.video/"
+"#,
+        );
+
+        // 通配命中：任意 xxx.xyz
+        assert_eq!(
+            get_referer_for_url("https://gokj68.xyz/hls/a/index.png?v=1", &config),
+            "https://rou.video/"
+        );
+        assert_eq!(
+            get_referer_for_url("https://v.rn245.xyz/x/index.jpg?v=1", &config),
+            "https://rou.video/"
+        );
+        // 域本身（不带前导标签）不命中通配
+        assert_eq!(
+            get_referer_for_url("https://xyz/foo", &config),
+            "https://default.com/"
+        );
+        // 非 xyz 域名回退全局默认
+        assert_eq!(
+            get_referer_for_url("https://surrit.com/a.m3u8", &config),
+            "https://default.com/"
+        );
+    }
+
+    #[test]
+    fn test_get_referer_for_url_priority() {
+        let config = make_config(
+            r#"
+m3u8_urls: []
+max_concurrent_downloads: 1
+download_retries: 1
+segment_timeout: 10
+retry_interval: 1
+referer: "https://default.com/"
+referers:
+  v.rn245.xyz: "https://exact/"
+  rn245.xyz: "https://tld/"
+  "*.xyz": "https://wild/"
+"#,
+        );
+
+        // 完整 host > TLD > 通配
+        assert_eq!(
+            get_referer_for_url("https://v.rn245.xyz/x.jpg", &config),
+            "https://exact/"
+        );
+        assert_eq!(
+            get_referer_for_url("https://rn245.xyz/x.jpg", &config),
+            "https://tld/"
+        );
+        assert_eq!(
+            get_referer_for_url("https://other.xyz/x.jpg", &config),
+            "https://wild/"
+        );
+    }
+
+    #[test]
+    fn test_extract_video_id_md5_fallback() {
+        // 无有效段时回退 MD5 前缀
+        let id = extract_video_id("https://example.com/master.m3u8");
+        assert!(id.starts_with("cf_"));
+        assert_eq!(id.len(), 13);
+    }
+
+    #[test]
+    fn test_extract_png_video_id() {
+        // 新节点：随机目录段有语义
+        let id = extract_png_video_id(
+            "https://cexd14.xyz/hls/cl49h8177005413gfeliyi1w5/iNwoM4GNPcI/index.png?v=1&auth=x",
+        );
+        assert_eq!(id, "iNwoM4GNPcI");
+        // rn245 变体：.jpg 假扩展名也要跳过
+        let id = extract_png_video_id(
+            "https://v.rn245.xyz/hls/cmuslv7h90000s62i69r94rnm/cmuslv7h90000s62i69r94rnm-720/index.jpg?v=1",
+        );
+        assert_eq!(id, "cmuslv7h90000s62i69r94rnm-720");
+        // 旧节点：{id}-720 目录
+        let id = extract_png_video_id(
+            "https://fuzb14.xyz/hls/cmubgg7ec0000s635h5fdog6w/cmubgg7ec0000s635h5fdog6w-720/index.png?v=1",
+        );
+        assert_eq!(id, "cmubgg7ec0000s635h5fdog6w-720");
+        // 无语义段回退 MD5
+        let id = extract_png_video_id("https://example.com/index.png?v=1");
+        assert!(id.starts_with("png_"));
+        assert_eq!(id.len(), 14);
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let start_time = Instant::now();
+    let mut config = video_processor::load_config()?;
+
+    // 初始化日志
+    Builder::new()
+        .filter(None, parse_log_level(&config.log_level))
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "[{} {}] {}",
+                Local::now().format("%Y-%m-%d %H:%M:%S"),
+                record.level(),
+                record.args()
+            )
+        })
+        .init();
+
+    info!("加载配置: {:?}", config);
+    info!("使用并发下载数: {}", config.max_concurrent_downloads);
+
+    // 常驻下载服务模式（配合油猴悬浮球脚本）：video_processor --server [--port=7777]
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--server") {
+        let port = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--port="))
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(7777);
+        return server::run_server(config, port).await;
+    }
+
+    // 自适应并发控制与缓冲区大小已移入 process_m3u8_batch（CLI 与 --server 共用）
+
+    // 检查是否需要清除缓存
+    if std::env::args().any(|arg| arg == "--clear-cache") {
+        info!("清除所有下载缓存...");
+        let download_dir = Path::new(&config.output_directory);
+        let temp_dir = download_dir.join("temp");
+        if temp_dir.exists() {
+            match tokio::fs::remove_dir_all(&temp_dir).await {
+                Ok(_) => info!("缓存目录已清除"),
+                Err(e) => warn!("清除缓存失败: {}", e),
+            }
+            match tokio::fs::create_dir_all(&temp_dir).await {
+                Ok(_) => info!("已创建新的缓存目录"),
+                Err(e) => warn!("创建缓存目录失败: {}", e),
+            }
+        }
+    }
+
+    // 检查是否指定了比特率
+    let mut global_referer = config.referer.clone();
+    for arg in std::env::args() {
+        if arg.starts_with("--bitrate=") {
+            let bitrate = arg.split('=').nth(1).unwrap_or("2M").to_string();
+            info!("使用命令行指定的视频比特率: {}", bitrate);
+            config.video_bitrate = Some(bitrate);
+        } else if arg == "--copy" {
+            // 强制使用copy模式
+            info!("使用copy模式，不重新编码视频");
+            config.video_codec = "copy".to_string();
+            config.use_hw_accel = false;
+        } else if arg == "--no-hw" {
+            // 禁用硬件加速
+            info!("禁用硬件加速");
+            config.use_hw_accel = false;
+        } else if arg.starts_with("--referer=") {
+            global_referer = arg.split('=').nth(1).unwrap_or(&global_referer).to_string();
+            info!("使用命令行指定的全局 Referer: {}", global_referer);
+        }
+    }
+
+    // 确保输出目录存在
+    let download_dir = Path::new(&config.output_directory);
+    if !download_dir.exists() {
+        create_dir_all(download_dir).await?;
+    }
+    let temp_dir = download_dir.join("temp");
+    if !temp_dir.exists() {
+        create_dir_all(&temp_dir).await?;
+    }
+
+    // M3U8 批量下载（管线已提取为独立函数，--server 模式复用同一实现）
+    process_m3u8_batch(&config.m3u8_urls, &config, &download_dir, &temp_dir).await?;
+
+    // PNG 伪装流批量下载（rou.video 风格，与 M3U8 流程完全独立）
+    for (i, png_url) in config.png_urls.iter().enumerate() {
+        if png_url.trim().is_empty() {
+            continue;
+        }
+        info!(
+            "处理 PNG 伪装流 [{}/{}]: {}",
+            i + 1,
+            config.png_urls.len(),
+            png_url
+        );
+
+        let url_referer = get_referer_for_url(png_url, &config);
+        let url_cookie = get_cookie_for_url(png_url, &config);
+        info!("URL {} 使用 Referer: {}", png_url, url_referer);
+        let client = Arc::new(create_http_client(
+            &url_referer,
+            &url_cookie,
+            config.segment_timeout,
+        )?);
+
+        // 命名：URL 语义段 + MD5 前 8 位防撞（与 M3U8 流程一致）
+        let output_name = {
+            let name = extract_png_video_id(png_url);
+            let hash = format!("{:x}", md5::compute(png_url));
+            format!("{}_{}", name, &hash[..hash.len().min(8)])
+        };
+
+        match video_processor::png_stream::download_png_stream(
+            &config,
+            client,
+            png_url,
+            &output_name,
+        )
+        .await
+        {
+            Ok(path) => {
+                info!("[PNG Stream] ✓ [{}] 处理完成: {}", i + 1, path.display());
+            }
+            Err(e) => {
+                // 单个 URL 失败不中断批量任务
+                error!("[PNG Stream] ✗ [{}] 失败: {}", i + 1, format!("{:#}", e));
+            }
         }
     }
 
