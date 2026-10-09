@@ -136,6 +136,11 @@ pub fn decode_resource(data: &[u8]) -> Result<PngStreamResource> {
     // 3. 裸 TS 分片（假扩展名，如 C-000.jpg）
     if data.first() == Some(&0x47) {
         if data.len() % 188 == 0 {
+            if !ts_fully_aligned(data) {
+                return Err(anyhow!(
+                    "校验失败: 裸 TS 中后段存在损坏（188 对齐处非 0x47 同步字节）"
+                ));
+            }
             return Ok(PngStreamResource::Ts(data.to_vec()));
         }
         return Err(anyhow!(
@@ -176,6 +181,13 @@ pub fn parse_segment_urls(playlist: &str, base_url: &str) -> Result<Vec<String>>
     Ok(urls)
 }
 
+/// 全量校验 MPEG-TS 数据：每个 188 字节包首必须是 0x47 同步字节。
+/// 只查头部几个包拦不住 CDN 中后段注入的垃圾/传输损坏
+/// （症状：FFmpeg remux 时大面积 Packet corrupt）
+fn ts_fully_aligned(data: &[u8]) -> bool {
+    data.chunks_exact(188).all(|pkt| pkt[0] == 0x47)
+}
+
 /// 剥离视频分片 roUd payload 的 1 字节类型前缀，返回纯 MPEG-TS 数据
 ///
 /// 判定规则（实测验证）：
@@ -194,6 +206,11 @@ pub fn strip_ts_prefix(payload: &[u8]) -> Result<Vec<u8>> {
                 payload.len()
             ));
         }
+        if !ts_fully_aligned(payload) {
+            return Err(anyhow!(
+                "校验失败: TS 中后段存在损坏（188 对齐处非 0x47 同步字节）"
+            ));
+        }
         return Ok(payload.to_vec());
     }
     if payload[0] == 0x00
@@ -201,7 +218,13 @@ pub fn strip_ts_prefix(payload: &[u8]) -> Result<Vec<u8>> {
         && (payload.len() - 1) % 188 == 0
         && payload[1] == 0x47
     {
-        return Ok(payload[1..].to_vec());
+        let ts = &payload[1..];
+        if !ts_fully_aligned(ts) {
+            return Err(anyhow!(
+                "校验失败: TS 中后段存在损坏（188 对齐处非 0x47 同步字节）"
+            ));
+        }
+        return Ok(ts.to_vec());
     }
     Err(anyhow!(
         "校验失败: roUd payload 不符合 TS 结构（长度 {}）",

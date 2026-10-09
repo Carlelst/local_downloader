@@ -117,14 +117,11 @@ pub(crate) fn is_valid_segment_signature(data: &[u8]) -> bool {
         return false;
     }
     if data[0] == 0x47 {
-        // 追加校验后续 TS 包同步字节（188 字节定长包），拦截首字节碰巧为 0x47 的垃圾数据
-        if data.len() > 188 && data[188] != 0x47 {
-            return false;
-        }
-        if data.len() > 376 && data[376] != 0x47 {
-            return false;
-        }
-        return true;
+        // 全量校验每个 188 字节包的同步字节（MPEG-TS 规范强制 0x47 定长对齐）。
+        // 只查头部 3 个包拦不住中后段损坏：CDN 反爬注入/传输损坏的分片头部正常、
+        // 内部是垃圾，FFmpeg remux 时会大面积报 Packet corrupt。
+        // 校验失败 → 视为数据错误 → 触发上层重下
+        return data.chunks_exact(188).all(|pkt| pkt[0] == 0x47);
     }
     // HLS 允许 TS 分片以 ID3 tag 开头（0x49 0x44 0x33），跳过 tag 后应为 0x47
     if data.len() >= 10 && &data[0..3] == b"ID3" {
@@ -136,7 +133,13 @@ pub(crate) fn is_valid_segment_signature(data: &[u8]) -> bool {
         if data.len() == ts_offset {
             return true; // 仅含 ID3 tag（无音视频数据），放行
         }
-        return data.len() > ts_offset && data[ts_offset] == 0x47;
+        if data.len() <= ts_offset || data[ts_offset] != 0x47 {
+            return false;
+        }
+        // ID3 后的 TS 主体同样做全量 188 对齐扫描
+        return data[ts_offset..]
+            .chunks_exact(188)
+            .all(|pkt| pkt[0] == 0x47);
     }
     if data.len() < 8 {
         return false;
@@ -471,6 +474,31 @@ mod tests {
         assert!(!is_valid_segment_signature(&[
             0x00, 0x00, 0x0f, 0xb0, 0x00, 0x00, 0x00, 0x00
         ]));
+    }
+
+    #[test]
+    fn test_signature_rejects_midstream_corruption() {
+        // 头部正常、中后段被注入垃圾的分片（CDN 反爬/传输损坏）：
+        // 全量 188 对齐扫描必须拦截，否则 FFmpeg remux 报大面积 Packet corrupt
+        let mut ts: Vec<u8> = Vec::new();
+        for i in 0..20 {
+            ts.push(0x47);
+            ts.extend(std::iter::repeat(0u8).take(187));
+        }
+        assert!(is_valid_segment_signature(&ts)); // 全部合法
+                                                  // 第 10 个包首被改成垃圾
+        ts[9 * 188] = 0xde;
+        assert!(!is_valid_segment_signature(&ts));
+        // ID3 开头的分片：TS 主体中段损坏同样拦截
+        let mut id3_ts: Vec<u8> = vec![b'I', b'D', b'3', 4, 0, 0, 0, 0, 0, 10];
+        id3_ts.extend(std::iter::repeat(0u8).take(10));
+        for i in 0..10 {
+            id3_ts.push(0x47);
+            id3_ts.extend(std::iter::repeat(0u8).take(187));
+        }
+        assert!(is_valid_segment_signature(&id3_ts));
+        id3_ts[20 + 5 * 188] = 0xad; // ID3 头(10)+tag主体(10) 之后的第 5 个 TS 包首
+        assert!(!is_valid_segment_signature(&id3_ts));
     }
 
     #[test]
