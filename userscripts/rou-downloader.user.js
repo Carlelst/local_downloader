@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         rou.video 悬浮球下载器
 // @namespace    https://rou.video/
-// @version      2.2.2
+// @version      2.2.3
 // @description  在 rou.video / missav 播放页右下角显示悬浮球：自动捕获视频地址并暂存为任务（跨页面持久化），点击球打开管理面板：批量发送下载、实时查看服务端进度、取消/重试、手动添加地址
 // @match        https://rou.video/*
 // @match        https://www.rou.video/*
@@ -12,6 +12,8 @@
 // @match        https://kanav.ad/*
 // @match        https://www.kanav.ad/*
 // @match        https://m1.kanav.fun/*
+// @match        https://91quanji.com/*
+// @match        https://www.91quanji.com/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
