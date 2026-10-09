@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         rou.video 悬浮球下载器
 // @namespace    https://rou.video/
-// @version      2.1.2
+// @version      2.1.3
 // @description  在 rou.video / missav 播放页右下角显示悬浮球：自动捕获视频地址并暂存为任务（跨页面持久化），点击球打开管理面板：批量发送下载、实时查看服务端进度、取消/重试、手动添加地址
 // @match        https://rou.video/*
 // @match        https://www.rou.video/*
@@ -464,6 +464,9 @@
                     } else if (sv.state === 'failed' || sv.state === 'cancelled') {
                         act = '<span class="act" data-act="retry">重试</span>';
                         if (sv.error) metaExtra = ' · ' + esc(sv.error.slice(0, 80));
+                    } else if (sv.state === 'done') {
+                        // 已完成也可重新下载（服务端 done 再提交=重新入队，输出为新文件名不覆盖旧文件）
+                        act = '<span class="act" data-act="retry">重下</span>';
                     }
                 } else if (t.status === 'failed') {
                     // GM 侧发送失败：点击重置为待下载，可再次批量发送
@@ -498,7 +501,7 @@
                         ? '<span class="act" data-act="cancel">取消</span>'
                         : ((sv.state === 'failed' || sv.state === 'cancelled')
                             ? '<span class="act" data-act="retry">重试</span>'
-                            : '');
+                            : (sv.state === 'done' ? '<span class="act" data-act="retry">重下</span>' : ''));
                     const del = ACTIVE_SRV.includes(sv.state)
                         ? ''
                         : '<span class="del" data-del="1" title="从列表移除">✕</span>';
