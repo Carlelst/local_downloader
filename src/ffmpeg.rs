@@ -79,8 +79,8 @@ pub async fn start_ffmpeg(
     let output_path = Path::new(&config.output_directory).join(&output_filename);
     let output_path_str = format!("{}", output_path.display());
 
-    // 检测硬件加速
-    let hw_accel = if config.use_hw_accel {
+    // 检测硬件加速（流复制 remux 用不到编码器，跳过检测——每次探测要起 ffmpeg 子进程跑约 1s）
+    let hw_accel = if config.use_hw_accel && config.video_codec != "copy" {
         detect_hw_accel().await
     } else {
         None
@@ -159,42 +159,13 @@ pub async fn start_ffmpeg(
         .arg("ignore_err"); // 忽略错误以提高鲁棒性
 
     // 视频和音频编码参数
-    if config.video_codec != "copy" || hw_accel.is_none() {
+    // video_codec=copy 时严格流复制（TS→MP4 纯 remux，仅受 IO 限制，1GB 视频几秒完成）。
+    // 绝不能因检测到硬件加速器就把 copy 替换成编码器——那是反优化：
+    // 全片重编码耗时暴涨数十倍，且默认 2Mbps 比特率会严重降质
+    if config.video_codec == "copy" {
+        cmd.arg("-c:v").arg("copy");
+    } else {
         cmd.arg("-c:v").arg(&config.video_codec);
-    } else if let Some(accel) = hw_accel {
-        // 如果指定了copy但有硬件加速器，使用相应的硬件编码器
-        match accel {
-            "videotoolbox" => {
-                info!("使用VideoToolbox硬件加速编码...");
-                cmd.arg("-c:v").arg("h264_videotoolbox");
-                // 如果没有设置比特率，添加默认比特率控制文件大小
-                if config.video_bitrate.is_none() {
-                    cmd.arg("-b:v").arg("2M");
-                    info!("应用默认视频比特率: 2Mbps");
-                }
-            }
-            "nvenc" => {
-                info!("使用NVIDIA硬件加速编码...");
-                cmd.arg("-c:v").arg("h264_nvenc");
-                // 如果没有设置比特率，添加默认比特率控制文件大小
-                if config.video_bitrate.is_none() {
-                    cmd.arg("-b:v").arg("2M");
-                    info!("应用默认视频比特率: 2Mbps");
-                }
-            }
-            "qsv" => {
-                info!("使用Intel QuickSync加速编码...");
-                cmd.arg("-c:v").arg("h264_qsv");
-                // 如果没有设置比特率，添加默认比特率控制文件大小
-                if config.video_bitrate.is_none() {
-                    cmd.arg("-b:v").arg("2M");
-                    info!("应用默认视频比特率: 2Mbps");
-                }
-            }
-            _ => {
-                cmd.arg("-c:v").arg(&config.video_codec);
-            }
-        }
     }
 
     // 设置比特率（如果指定）
@@ -215,8 +186,7 @@ pub async fn start_ffmpeg(
     // 200MB 视频实测多花数分钟。本工具产出的是本地完整文件（先下载完再 remux），
     // moov 在尾部对本地播放（VLC/IINA/mpv/浏览器 file://）无影响；
     // 若需要网页边下边播，在输出命令后手动执行 ffmpeg -i in.mp4 -c copy -movflags +faststart out.mp4
-    cmd.arg("-shortest")
-        .arg(&output_path_str);
+    cmd.arg("-shortest").arg(&output_path_str);
 
     // 设置日志级别（ffmpeg 的 info 会直接向终端刷 progress 行，混入日志输出，故最高只给 warning）
     let log_level = match config.log_level.as_str() {
