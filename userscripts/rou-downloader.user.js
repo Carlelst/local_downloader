@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         rou.video 悬浮球下载器
 // @namespace    https://rou.video/
-// @version      2.2.3
+// @version      2.2.4
 // @description  在 rou.video / missav 播放页右下角显示悬浮球：自动捕获视频地址并暂存为任务（跨页面持久化），点击球打开管理面板：批量发送下载、实时查看服务端进度、取消/重试、手动添加地址
 // @match        https://rou.video/*
 // @match        https://www.rou.video/*
@@ -664,7 +664,7 @@
             panel.querySelector('.close').onclick = () => panel.classList.remove('open');
             // tab 切换（待下载/进行中/已结束）
             panel.querySelectorAll('.ptab').forEach((el) => {
-                el.onclick = () => { curTab = el.dataset.tab; renderPanel(); };
+                el.onclick = () => { curTab = el.dataset.tab; selected.clear(); renderPanel(); };
             });
             panel.querySelectorAll('.item').forEach((el) => {
                 const id = el.dataset.id;
@@ -686,9 +686,14 @@
                 });
             });
             panel.querySelector('#rd-sel').onclick = () => {
-                const all = loadTasks();
-                if (selected.size >= all.length) selected = new Set();
-                else all.forEach((t) => selected.add(t.id));
+                // 全选只针对"待下载"tab 的任务：已入队/已结束的重下走行内 [重下]，
+                // 绝不进批量发送（否则一键全选会把已完成任务全部重下）
+                const cand = loadTasks()
+                    .filter((t) => t.status === 'pending' || t.status === 'failed')
+                    .map((t) => t.id);
+                const allSelected = cand.length > 0 && cand.every((id) => selected.has(id));
+                if (allSelected) cand.forEach((id) => selected.delete(id));
+                else cand.forEach((id) => selected.add(id));
                 renderPanel();
             };
             panel.querySelector('#rd-clr').onclick = () => {
@@ -789,10 +794,13 @@
             const btn = panel.querySelector('#rd-dl');
             btn.disabled = true;
             const ids = [...selected];
-            let okCount = 0, failCount = 0;
+            let okCount = 0, failCount = 0, skipCount = 0;
             for (const id of ids) {
                 const t = loadTasks().find((x) => x.id === id);
                 if (!t) continue;
+                // 保险：已入队/发送中的任务跳过（防跨 tab 勾选残留导致重复下载）；
+                // 已结束任务的重下走行内 [重下] 按钮
+                if (t.status === 'sent' || t.status === 'sending') { skipCount++; continue; }
                 updateTask(id, { status: 'sending' });
                 renderPanel();
                 const r = await sendOne(t);
@@ -801,8 +809,11 @@
                 renderPanel();
             }
             sending = false;
-            showTip(`批量发送完成：${okCount} 成功${failCount ? '，' + failCount + ' 失败（详情见面板）' : ''}`,
-                failCount ? '#ffb74d' : '#81c784');
+            showTip(
+                `批量发送完成：${okCount} 成功${failCount ? '，' + failCount + ' 失败（详情见面板）' : ''}` +
+                (skipCount ? `，${skipCount} 个已入队任务已跳过` : ''),
+                failCount ? '#ffb74d' : '#81c784'
+            );
         }
 
         // ---- 拖动 + 点击 ----
