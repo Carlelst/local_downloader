@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         rou.video 悬浮球下载器
 // @namespace    https://rou.video/
-// @version      2.2.4
+// @version      2.2.5
 // @description  在 rou.video / missav 播放页右下角显示悬浮球：自动捕获视频地址并暂存为任务（跨页面持久化），点击球打开管理面板：批量发送下载、实时查看服务端进度、取消/重试、手动添加地址
 // @match        https://rou.video/*
 // @match        https://www.rou.video/*
@@ -36,7 +36,7 @@
     // 标准 m3u8（missav 等，hls.js 的 XHR/fetch 请求）
     const M3U8_RE = /\.m3u8(\?|#|$)/i;
     // missav 页面源码里 eval 混淆的 m3u8 字符串数组（"m3u8|" 拼接），网络 hook 抓不到时兜底
-    const SOURCE_RE = /["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/i;
+    const SOURCE_RE = /["'`](https?:\/\/[^"'`]+\.m3u8[^"'`]*)["'`]/i;
 
     // 播放器可能在 iframe 里：Tampermonkey 默认向所有 frame 注入本脚本，
     // 每个 frame 各自捕获（直接写 GM 存储，天然跨 frame 共享），iframe 命中后同时 postMessage 通知顶层刷新角标
@@ -167,7 +167,8 @@
 
     function capture(url, source) {
         if (!url || typeof url !== 'string') return;
-        const clean = url.split('#')[0];
+        // 反引号包裹的地址（kanav 等 maccms 站 player 变量里 url 被 ` 包着）先剥掉
+        const clean = url.replace(/`/g, '').trim().split('#')[0];
         if (M3U8_RE.test(clean) || PLAYLIST_RE.test(clean)) {
             const title = pageTitle() || titleFromUrl(clean);
             const r = addTask(clean, title);
@@ -273,7 +274,29 @@
 
     // ---------- 1.5 网络记录轮询 ----------
     // 持续扫描不停止：SPA 站内导航时 load 只触发一次，后续视频只能靠轮询兜底
-    setInterval(() => scanPerformance(), 2000);
+
+    // ---------- 1.5.5 maccms 播放变量捕获 ----------
+    // maccms 采集站（kanav 等）顶层 window.player_aaaa.url 直接是播放地址，
+    // 而播放器常在深嵌 iframe/worker 里加载视频（顶层/注入 frame 的 resource
+    // 记录里根本没有 m3u8 请求，网络通道抓不到）。直接扫变量最稳。
+    // encrypt 编码不定（明文/urlencode/base64），多编码候选全丢给 capture 过滤，
+    // 非播放地址的候选被 M3U8_RE 拦截，无副作用
+    function captureMaccmsPlayer() {
+        try {
+            const w = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+            const raw = w.player_aaaa && w.player_aaaa.url;
+            if (typeof raw !== 'string' || !raw) return;
+            const cands = [raw];
+            try { cands.push(decodeURIComponent(raw)); } catch (e) { /* 非 urlencode */ }
+            try { cands.push(atob(raw)); } catch (e) { /* 非 base64 */ }
+            try { cands.push(decodeURIComponent(atob(raw))); } catch (e) { /* 组合失败 */ }
+            for (const c of cands) {
+                if (c && /https?:\/\//i.test(c)) capture(c, 'player变量');
+            }
+        } catch (e) { /* 忽略 */ }
+    }
+
+    setInterval(() => { scanPerformance(); captureMaccmsPlayer(); }, 2000);
 
     // ---------- 1.6 API 重放兜底 ----------
     // 页面加载时顶层 JS 必定调用过本站 API 获取播放源；GM_xmlhttpRequest 重放
@@ -709,6 +732,7 @@
                 const before = loadTasks().filter((t) => t.status === 'pending').length;
                 scanPageSource();
                 scanPerformance();
+                captureMaccmsPlayer();
                 await captureFromApiReplay();
                 renderPanel();
                 // 按待下载数变化提示：refresh（已有任务刷新地址/标题）不算新捕获，但也不是失败
