@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         rou.video 悬浮球下载器
 // @namespace    https://rou.video/
-// @version      2.0.0
-// @description  在 rou.video / missav 播放页右下角显示悬浮球：自动捕获视频地址并暂存为任务（跨页面持久化），点击球打开管理面板，勾选批量发送到本地 video_processor --server 下载
+// @version      2.1.0
+// @description  在 rou.video / missav 播放页右下角显示悬浮球：自动捕获视频地址并暂存为任务（跨页面持久化），点击球打开管理面板：批量发送下载、实时查看服务端进度、取消/重试、手动添加地址
 // @match        https://rou.video/*
 // @match        https://www.rou.video/*
 // @match        https://missav.ws/*
@@ -55,6 +55,17 @@
         for (let i = 0; i < url.length; i++) { h = (h * 31 + url.charCodeAt(i)) | 0; }
         return 't' + (h >>> 0).toString(36);
     }
+    // 从 URL 提取语义标题（页面 title 常是站点通用名，URL 里的视频 id 更有区分度）
+    function titleFromUrl(url) {
+        try {
+            const u = new URL(url);
+            const segs = u.pathname.split('/').filter(Boolean);
+            const skip = /^(index|playlist)\.(png|jpg|jpeg|webp|m3u8)$/i;
+            const seg = [...segs].reverse().find((s) => !skip.test(s));
+            const t = seg || u.host;
+            return t.length > 80 ? t.slice(0, 80) : t;
+        } catch (e) { return url.slice(0, 60); }
+    }
     /** 捕获入队：同 URL 去重；返回是否新增/刷新 */
     function addTask(url, title) {
         const tasks = loadTasks();
@@ -101,7 +112,7 @@
         if (!url || typeof url !== 'string') return;
         const clean = url.split('#')[0];
         if (M3U8_RE.test(clean) || PLAYLIST_RE.test(clean)) {
-            const added = addTask(clean, document.title);
+            const added = addTask(clean, titleFromUrl(clean));
             if (added) {
                 console.log('[rou-dl] ✓ 已捕获并暂存 (' + source + '):', clean);
                 notifyTasksChanged();
@@ -290,6 +301,14 @@
             .st.failed { background: #ffebee; color: #b71c1c; }
             .item .del { flex: none; cursor: pointer; color: #bbb; font-size: 15px; padding: 0 4px; }
             .item .del:hover { color: #e53935; }
+            .item.srv { background: #fafbff; }
+            .act { flex: none; cursor: pointer; font-size: 11px; padding: 2px 8px; border-radius: 10px;
+                   background: #e3f2fd; color: #1565c0; }
+            .act:hover { background: #bbdefb; }
+            .p-add { display: flex; gap: 8px; padding: 10px 16px 0; }
+            .p-add input { flex: 1; min-width: 0; font: 12px/1.4 -apple-system, sans-serif; padding: 7px 10px;
+                           border: 1px solid #ddd; border-radius: 6px; outline: none; }
+            .p-add input:focus { border-color: #2b5fd9; }
             .p-empty { padding: 32px 16px; text-align: center; color: #999; }
             .p-foot { padding: 10px 16px; border-top: 1px solid #eee; display: flex; gap: 8px; align-items: center; }
             .p-foot .grow { flex: 1; }
@@ -342,6 +361,18 @@
         // ---- 管理面板 ----
         let selected = new Set();
         let sending = false;
+        // 服务端任务状态（GET /status 轮询）：url -> {state,segments,error,name}
+        let serverTasks = {};
+        let serverCounts = null;
+        let lastStatusJson = '';
+        const SRV_ST = {
+            queued: ['排队中', 'sending'],
+            downloading: ['下载中', 'sending'],
+            cancelling: ['取消中', 'failed'],
+            done: ['完成', 'sent'],
+            failed: ['失败', 'failed'],
+            cancelled: ['已取消', 'failed'],
+        };
 
         function fmtTime(ts) {
             const d = new Date(ts);
@@ -360,26 +391,85 @@
             const ids = new Set(tasks.map((t) => t.id));
             selected = new Set([...selected].filter((i) => ids.has(i)));
             const stText = { pending: '待下载', sending: '发送中', sent: '已入队', failed: '失败' };
-            const rows = tasks.map((t) => `
-                <div class="item" data-id="${t.id}">
+            const ACTIVE_SRV = ['queued', 'downloading', 'cancelling'];
+            const rows = tasks.map((t) => {
+                // 已入队任务合并显示服务端实时状态
+                const sv = t.status === 'sent' ? serverTasks[t.url] : null;
+                let chip = `<span class="st ${t.status}">${stText[t.status] || t.status}</span>`;
+                let act = '';
+                let metaExtra = t.err ? ' · ' + esc(t.err.slice(0, 60)) : '';
+                if (sv) {
+                    const [lbl, cls] = SRV_ST[sv.state] || [sv.state, 'sending'];
+                    chip = `<span class="st ${cls}">${lbl}</span>`;
+                    if (sv.segments) metaExtra = ' · ' + sv.segments + ' 分片' + metaExtra;
+                    if (ACTIVE_SRV.includes(sv.state)) {
+                        act = '<span class="act" data-act="cancel">取消</span>';
+                    } else if (sv.state === 'failed' || sv.state === 'cancelled') {
+                        act = '<span class="act" data-act="retry">重试</span>';
+                        if (sv.error) metaExtra = ' · ' + esc(sv.error.slice(0, 80));
+                    }
+                } else if (t.status === 'failed') {
+                    // GM 侧发送失败：点击重置为待下载，可再次批量发送
+                    act = '<span class="act" data-act="resend">重试</span>';
+                }
+                return `
+                <div class="item" data-id="${t.id}" data-url="${esc(t.url)}">
                     <input type="checkbox" ${selected.has(t.id) ? 'checked' : ''}>
                     <div class="info">
                         <div class="t" title="${esc(t.url)}">${esc(t.title)}</div>
-                        <div class="meta">${esc(t.host)} · ${fmtTime(t.t)}${t.err ? ' · ' + esc(t.err.slice(0, 60)) : ''}</div>
+                        <div class="meta">${esc(t.host)} · ${fmtTime(t.t)}${metaExtra}</div>
                     </div>
-                    <span class="st ${t.status}">${stText[t.status] || t.status}</span>
+                    ${chip}
+                    ${act}
                     <span class="del" title="删除">✕</span>
-                </div>`);
+                </div>`;
+            });
+            // 服务端有、本列表没有的任务（服务重启前的残留 / 其他页面发送的）
+            const srvOnly = Object.values(serverTasks)
+                .filter((sv) => !ids.has(taskId(sv.url)))
+                .map((sv) => {
+                    const [lbl, cls] = SRV_ST[sv.state] || [sv.state, 'sending'];
+                    let host = '';
+                    try { host = new URL(sv.url).host; } catch (e) { /* 忽略 */ }
+                    const act = ACTIVE_SRV.includes(sv.state)
+                        ? '<span class="act" data-act="cancel">取消</span>'
+                        : ((sv.state === 'failed' || sv.state === 'cancelled')
+                            ? '<span class="act" data-act="retry">重试</span>'
+                            : '');
+                    const del = ACTIVE_SRV.includes(sv.state)
+                        ? ''
+                        : '<span class="del" data-del="1" title="从列表移除">✕</span>';
+                    return `
+                <div class="item srv" data-url="${esc(sv.url)}">
+                    <input type="checkbox" disabled>
+                    <div class="info">
+                        <div class="t" title="${esc(sv.url)}">${esc(sv.name || sv.url.slice(0, 60))}</div>
+                        <div class="meta">${esc(host)}${sv.segments ? ' · ' + sv.segments + ' 分片' : ''}${sv.error ? ' · ' + esc(sv.error.slice(0, 60)) : ''}</div>
+                    </div>
+                    <span class="st ${cls}">${lbl}</span>
+                    ${act}
+                    ${del}
+                </div>`;
+                });
+            const c = serverCounts;
+            const cnt = c
+                ? `排队 ${c.queued || 0} · 下载 ${(c.downloading || 0) + (c.cancelling || 0)} · 完成 ${c.done || 0} · 失败 ${(c.failed || 0) + (c.cancelled || 0)}`
+                : '';
+            const all = rows.concat(srvOnly);
             panel.innerHTML = `
                 <div class="p-head">
-                    <span class="title">下载任务（${tasks.length}）</span>
+                    <span class="title">下载任务（${all.length}）</span>
                     <span class="close" title="关闭">✕</span>
                 </div>
                 <div class="p-status" id="rd-status">
                     <span class="dot" id="rd-dot"></span><span id="rd-srv">检测本地服务…</span>
-                    <span style="margin-left:auto" id="rd-cnt"></span>
+                    <span style="margin-left:auto" id="rd-cnt">${esc(cnt)}</span>
                 </div>
-                <div class="p-list">${rows.length ? rows.join('') : '<div class="p-empty">暂无任务<br>打开播放页让视频播放 2-3 秒，会自动捕获暂存</div>'}</div>
+                <div class="p-list">${all.length ? all.join('') : '<div class="p-empty">暂无任务<br>打开播放页让视频播放 2-3 秒，会自动捕获暂存</div>'}</div>
+                <div class="p-add">
+                    <input id="rd-url" type="text" placeholder="手动粘贴视频地址（index.png / .m3u8，含 auth 参数）">
+                    <button id="rd-add">添加</button>
+                </div>
                 <div class="p-foot">
                     <button id="rd-sel">全选</button>
                     <button id="rd-clr" class="danger">清除已结束</button>
@@ -390,15 +480,72 @@
             checkServer();
         }
 
+        // 面板动作：取消 / 重试（服务端重下）/ 重发（GM 侧失败重置）/ 移除（服务端列表）
+        async function doAction(act, url) {
+            if (!url) return;
+            if (act === 'cancel') {
+                GM_xmlhttpRequest({
+                    method: 'POST', url: SERVER + '/cancel', timeout: 5000,
+                    headers: { 'Content-Type': 'application/json' },
+                    data: JSON.stringify({ url }),
+                    onload: () => { pollStatus(); showTip('已请求取消，下载中任务会在分片间隙停止并清理缓存', '#ffb74d'); },
+                    onerror: () => showTip('取消失败：本地服务未响应', '#ffb74d'),
+                    ontimeout: () => showTip('取消请求超时', '#ffb74d'),
+                });
+            } else if (act === 'retry') {
+                const r = await sendOne({ url });
+                showTip(r.ok ? '已重新入队下载' : '重试失败：' + r.msg, r.ok ? '#81c784' : '#ffb74d');
+                pollStatus();
+            } else if (act === 'resend') {
+                updateTask(taskId(url), { status: 'pending', err: '' });
+                renderPanel();
+            } else if (act === 'forget') {
+                GM_xmlhttpRequest({
+                    method: 'POST', url: SERVER + '/forget', timeout: 5000,
+                    headers: { 'Content-Type': 'application/json' },
+                    data: JSON.stringify({ url }),
+                    onload: () => pollStatus(),
+                    onerror: () => {},
+                });
+            }
+        }
+
+        function addManually() {
+            const inp = panel.querySelector('#rd-url');
+            const raw = (inp.value || '').trim();
+            if (!raw) return;
+            const url = raw.split('#')[0];
+            if (!/^https?:\/\//i.test(url)) { showTip('请输入 http(s):// 开头的完整地址', '#ffb74d'); return; }
+            if (addTask(url, titleFromUrl(url))) {
+                inp.value = '';
+                notifyTasksChanged();
+                renderPanel();
+                showTip('已添加，勾选后点"下载选中"', '#81c784');
+            } else {
+                showTip('该地址已在任务列表中', '#ffb74d');
+            }
+        }
+
         function bindPanel() {
             panel.querySelector('.close').onclick = () => panel.classList.remove('open');
             panel.querySelectorAll('.item').forEach((el) => {
                 const id = el.dataset.id;
-                el.querySelector('input[type=checkbox]').onchange = (e) => {
-                    if (e.target.checked) selected.add(id); else selected.delete(id);
-                    panel.querySelector('#rd-dl').textContent = `下载选中 (${selected.size})`;
-                };
-                el.querySelector('.del').onclick = () => { removeTasks([id]); selected.delete(id); renderPanel(); };
+                const url = el.dataset.url;
+                const cb = el.querySelector('input[type=checkbox]');
+                if (cb && !cb.disabled) {
+                    cb.onchange = (e) => {
+                        if (e.target.checked) selected.add(id); else selected.delete(id);
+                        panel.querySelector('#rd-dl').textContent = `下载选中 (${selected.size})`;
+                    };
+                    el.querySelector('.del').onclick = () => { removeTasks([id]); selected.delete(id); renderPanel(); };
+                } else {
+                    // 服务端任务行：✕ = 从服务端列表移除
+                    const d = el.querySelector('.del');
+                    if (d) d.onclick = () => doAction('forget', url);
+                }
+                el.querySelectorAll('.act').forEach((a) => {
+                    a.onclick = () => doAction(a.dataset.act, url);
+                });
             });
             panel.querySelector('#rd-sel').onclick = () => {
                 const all = loadTasks();
@@ -411,6 +558,40 @@
                 renderPanel();
             };
             panel.querySelector('#rd-dl').onclick = () => batchSend();
+            panel.querySelector('#rd-add').onclick = addManually;
+            panel.querySelector('#rd-url').onkeydown = (e) => { if (e.key === 'Enter') addManually(); };
+        }
+
+        // ---- 服务端任务状态轮询（GET /status，2s）----
+        function pollStatus() {
+            GM_xmlhttpRequest({
+                method: 'GET', url: SERVER + '/status', timeout: 2500,
+                onload: (resp) => {
+                    try {
+                        const d = JSON.parse(resp.responseText);
+                        if (d && d.ok) {
+                            const map = {};
+                            (d.tasks || []).forEach((t) => { map[t.url] = t; });
+                            serverTasks = map;
+                            serverCounts = d.counts || {};
+                            const snap = JSON.stringify([serverTasks, serverCounts]);
+                            if (snap !== lastStatusJson) {
+                                lastStatusJson = snap;
+                                refreshBadge();
+                                // 面板打开且未在输入框打字时才重绘（避免打断输入）
+                                const input = panel.querySelector('#rd-url');
+                                if (panel.classList.contains('open') && shadow.activeElement !== input) renderPanel();
+                            }
+                        }
+                    } catch (e) { /* 忽略 */ }
+                },
+                onerror: () => {
+                    if (serverCounts) {
+                        serverTasks = {}; serverCounts = null; lastStatusJson = '';
+                        if (panel.classList.contains('open')) renderPanel();
+                    }
+                },
+            });
         }
 
         function checkServer() {
@@ -523,6 +704,9 @@
         // 角标轮询：其他页面/frame 写入 GM 存储后这里也能看到（GM 存储全局共享）
         setInterval(refreshBadge, 2000);
         refreshBadge();
+        // 服务端任务状态轮询（面板进度 / 取消 / 重试的数据源）
+        pollStatus();
+        setInterval(pollStatus, 2000);
         window.addEventListener('load', () => { scanPageSource(); refreshBadge(); });
     }
 

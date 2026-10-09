@@ -6,6 +6,7 @@ use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::fs::{create_dir_all, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
@@ -311,14 +312,22 @@ fn create_http_client(referer: &str, cookie: &str, timeout_secs: u64) -> Result<
 
 // 批量处理 M3U8 URL（CLI 与 --server 共用的下载管线，含断点续传/AES 解密/CF bypass）
 // 单条 URL 失败只跳过自身，不中断批量
+/// 批量处理 m3u8 下载（CLI 与 --server 共用管线）
+///
+/// `cancel` 为取消标志：--server 模式传入，任务取消后在分片/写入检查点快速退出；
+/// CLI 模式传 None（无取消能力）。
 pub async fn process_m3u8_batch(
     urls: &[String],
     config: &video_processor::Config,
     download_dir: &Path,
     temp_dir: &Path,
+    cancel: Option<Arc<AtomicBool>>,
 ) -> Result<()> {
     // 转为 owned，便于下方 spawn 的下载任务捕获（&引用不能逃逸到 'static 任务）
     let config = config.clone();
+
+    // 取消检查辅助：任一检查点命中即快速退出，上层负责落终态与清理
+    let is_cancelled = || cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
 
     // 增加自适应并发控制
     let adaptive_concurrency = Arc::new(RwLock::new(config.max_concurrent_downloads));
@@ -335,6 +344,12 @@ pub async fn process_m3u8_batch(
     for (i, m3u8_url) in urls.iter().enumerate() {
         if m3u8_url.trim().is_empty() {
             continue;
+        }
+
+        // 取消检查点：URL 之间
+        if is_cancelled() {
+            info!("任务已取消，停止处理剩余 URL");
+            return Err(anyhow!("任务已取消"));
         }
 
         // Cloudflare 旁路：检测到 surrit.com / fourhoi.com 等走 Python+curl-cffi
@@ -549,10 +564,22 @@ pub async fn process_m3u8_batch(
             let adaptive_concurrency_clone = Arc::clone(&adaptive_concurrency);
             let bandwidth_monitor_clone = Arc::clone(&bandwidth_monitor);
             let failed_segments_clone = Arc::clone(&failed_segments);
+            let cancel_flag = cancel.clone();
 
             // 启动下载任务
             let task = tokio::spawn(async move {
                 let _permit = semaphore.acquire().await.expect("获取信号量失败");
+
+                // 取消检查点：任务取消后快速失败，不再发起新分片下载
+                if cancel_flag
+                    .as_ref()
+                    .is_some_and(|c| c.load(Ordering::Relaxed))
+                {
+                    failed_segments_clone.write().await.insert(idx);
+                    to_download.write().await.remove(&idx);
+                    return;
+                }
+
                 let start_time = Instant::now();
 
                 // 记录开始下载
@@ -834,8 +861,14 @@ pub async fn process_m3u8_batch(
         // 如果有新下载的片段通知，继续处理
         let expected_segments = to_download.read().await.len();
         let mut received_segments = 0;
+        let mut task_cancelled = false;
 
         while let Some(idx) = notify_rx.recv().await {
+            // 取消检查点：写入循环（下载的主要耗时阶段）
+            if is_cancelled() {
+                task_cancelled = true;
+                break;
+            }
             received_segments += 1;
 
             // 更新进度
@@ -890,6 +923,17 @@ pub async fn process_m3u8_batch(
                     }
                 }
             }
+        }
+
+        // 取消：杀掉 FFmpeg 子进程、中止未完成下载任务，交给上层落终态与清理
+        if task_cancelled {
+            error!("M3U8 [{}] 任务已取消，终止 FFmpeg 处理", i + 1);
+            drop(buffered_stdin);
+            let _ = ffmpeg.start_kill();
+            for task in download_tasks.drain(..) {
+                task.abort();
+            }
+            return Err(anyhow!("任务已取消"));
         }
 
         // 保存当前已下载片段的信息，用于断点续传
@@ -1233,7 +1277,7 @@ async fn main() -> Result<()> {
     }
 
     // M3U8 批量下载（管线已提取为独立函数，--server 模式复用同一实现）
-    process_m3u8_batch(&config.m3u8_urls, &config, &download_dir, &temp_dir).await?;
+    process_m3u8_batch(&config.m3u8_urls, &config, &download_dir, &temp_dir, None).await?;
 
     // PNG 伪装流批量下载（rou.video 风格，与 M3U8 流程完全独立）
     for (i, png_url) in config.png_urls.iter().enumerate() {
@@ -1268,6 +1312,7 @@ async fn main() -> Result<()> {
             client,
             png_url,
             &output_name,
+            None,
         )
         .await
         {

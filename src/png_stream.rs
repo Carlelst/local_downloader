@@ -198,6 +198,7 @@ pub fn strip_ts_prefix(payload: &[u8]) -> Result<Vec<u8>> {
 /// - `client`: 已按域名配置好 Referer/Cookie 的 HTTP 客户端
 /// - `url`: playlist 资源（index.png / index.jpg 等）的完整 URL（含 query 认证参数）
 /// - `output_name`: 输出文件名（不含扩展名，调用方负责防撞命名）
+/// - `cancel`: 取消标志（--server 模式传入；CLI 传 None）。在分片与合成检查点快速退出
 ///
 /// # 返回
 /// 输出文件完整路径
@@ -206,7 +207,19 @@ pub async fn download_png_stream(
     client: Arc<Client>,
     url: &str,
     output_name: &str,
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<PathBuf> {
+    let is_cancelled = || {
+        cancel
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    };
+
+    // 取消检查点：入口
+    if is_cancelled() {
+        return Err(anyhow!("任务已取消"));
+    }
+
     // 分片较大（~1-3MB），保底 120s 超时以兼容慢速代理
     let timeout_secs = config.segment_timeout.max(120);
 
@@ -252,9 +265,19 @@ pub async fn download_png_stream(
         let completed = Arc::clone(&completed);
         let retries = config.download_retries;
         let retry_interval = config.retry_interval;
+        let cancel_task = cancel.clone();
 
         let task = tokio::spawn(async move {
             let _permit = semaphore.acquire().await.expect("获取信号量失败");
+
+            // 取消检查点：任务取消后快速失败，不再发起新分片下载
+            if cancel_task
+                .as_ref()
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                failed.write().await.push(idx);
+                return;
+            }
 
             let result: Result<Vec<u8>> = async {
                 let png = download_with_retry(
@@ -305,11 +328,18 @@ pub async fn download_png_stream(
     // 3. 任一分片失败则整体中止（不产出残缺文件）
     let failed_idx = failed.read().await.clone();
     if !failed_idx.is_empty() {
+        // 取消优先于失败判定：命中取消标志时按取消语义返回，上层据此清理
+        if is_cancelled() {
+            return Err(anyhow!("任务已取消"));
+        }
         return Err(anyhow!(
             "{} 个分片下载/校验失败: {:?}，放弃合成（不产出残缺文件）",
             failed_idx.len(),
             failed_idx
         ));
+    }
+    if is_cancelled() {
+        return Err(anyhow!("任务已取消"));
     }
 
     // 4. 按序写入 FFmpeg
