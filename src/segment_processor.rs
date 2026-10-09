@@ -117,6 +117,11 @@ pub(crate) fn is_valid_segment_signature(data: &[u8]) -> bool {
         return false;
     }
     if data[0] == 0x47 {
+        // 长度必须严格为 188 的整数倍：chunks_exact 会忽略尾部残余字节，
+        // 而残余会让拼接流失去 188 对齐 → 之后所有包错位 → FFmpeg 大面积 Packet corrupt
+        if data.len() % 188 != 0 {
+            return false;
+        }
         // 全量校验每个 188 字节包的同步字节（MPEG-TS 规范强制 0x47 定长对齐）。
         // 只查头部 3 个包拦不住中后段损坏：CDN 反爬注入/传输损坏的分片头部正常、
         // 内部是垃圾，FFmpeg remux 时会大面积报 Packet corrupt。
@@ -133,10 +138,11 @@ pub(crate) fn is_valid_segment_signature(data: &[u8]) -> bool {
         if data.len() == ts_offset {
             return true; // 仅含 ID3 tag（无音视频数据），放行
         }
-        if data.len() <= ts_offset || data[ts_offset] != 0x47 {
+        // TS 主体严格 188 整数倍 + 全量同步字节扫描
+        if data.len() <= ts_offset || data[ts_offset] != 0x47 || (data.len() - ts_offset) % 188 != 0
+        {
             return false;
         }
-        // ID3 后的 TS 主体同样做全量 188 对齐扫描
         return data[ts_offset..]
             .chunks_exact(188)
             .all(|pkt| pkt[0] == 0x47);
@@ -489,6 +495,11 @@ mod tests {
                                                   // 第 10 个包首被改成垃圾
         ts[9 * 188] = 0xde;
         assert!(!is_valid_segment_signature(&ts));
+        // 尾部残余字节（长度非 188 整数倍）同样拦截——残余会让拼接流错位
+        let mut ts_tail = ts.clone();
+        ts_tail[9 * 188] = 0x47;
+        ts_tail.extend_from_slice(&[0x47, 0x01, 0x02]);
+        assert!(!is_valid_segment_signature(&ts_tail));
         // ID3 开头的分片：TS 主体中段损坏同样拦截
         let mut id3_ts: Vec<u8> = vec![b'I', b'D', b'3', 4, 0, 0, 0, 0, 0, 10];
         id3_ts.extend(std::iter::repeat(0u8).take(10));
