@@ -6,8 +6,9 @@
 参数：
   --url M3U8_URL       必填
   --referer URL        必填
-  --output PATH        必填
-  --work-dir PATH      临时目录（必填）
+  --output PATH        整片下载模式必填
+  --work-dir PATH      临时目录（整片下载模式必填）
+  --probe              预检模式：仅下载 URL 内容，原始字节写到 stdout 后退出
   --concurrent N       并发数（默认 12）
   --cookie STRING      可选 Cookie（部分 CF 站点仍需 cf_clearance）
 
@@ -54,21 +55,38 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True)
     parser.add_argument("--referer", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--work-dir", required=True)
+    parser.add_argument("--output", default="")
+    parser.add_argument("--work-dir", default="")
+    parser.add_argument("--probe", action="store_true",
+                        help="预检模式：仅下载 URL 内容，原始字节写到 stdout 后退出")
     parser.add_argument("--concurrent", type=int, default=12)
     parser.add_argument("--cookie", default="", help="可选 Cookie 字符串")
-    args = parser.parse_args()
 
-    work_dir = Path(args.work_dir)
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    work_dir.mkdir(parents=True, exist_ok=True)
+    args = parser.parse_args()
 
     headers = dict(HEADERS_TEMPLATE)
     headers["Referer"] = args.referer
     if args.cookie:
         headers["Cookie"] = args.cookie
+
+    # ========== 预检模式：只取 playlist 资源 ==========
+    if args.probe:
+        r = requests.get(args.url, impersonate="chrome", headers=headers, timeout=30)
+        if r.status_code != 200:
+            log(f"❌ 预检下载失败: HTTP {r.status_code}")
+            sys.exit(1)
+        # 原始字节输出（可能是明文 m3u8 或 PNG 伪装资源，由调用方按内容探测解码）
+        sys.stdout.buffer.write(r.content)
+        sys.stdout.buffer.flush()
+        return
+
+    if not args.output or not args.work_dir:
+        parser.error("整片下载模式需要 --output 与 --work-dir")
+
+    work_dir = Path(args.work_dir)
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
 
     # ========== 阶段 1: 下载 M3U8 ==========
     log("阶段 1: 下载 M3U8")

@@ -340,9 +340,24 @@ async fn handle_download(
         Err(e) => precheck_fail!(format!("创建 HTTP 客户端失败: {:#}", e)),
     };
 
-    let raw = match video_processor::download_with_retry(&client, &url, 120, 1, 1, None).await {
-        Ok(d) => d,
-        Err(e) => precheck_fail!(format!("playlist 下载失败: {:#}", e)),
+    let raw = if video_processor::cloudflare_bypass::CloudflareBypassDownloader::needs_bypass(&url)
+    {
+        // CF 防护域名（surrit.com 等）：reqwest 被盾拦截（403 challenge），
+        // 预检必须走 Python+curl-cffi 探针，主管线会自动路由到同一通道下载
+        info!("[Server] CF 防护域名，预检走 curl-cffi: {}", url);
+        let project_root =
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let bypass =
+            video_processor::cloudflare_bypass::CloudflareBypassDownloader::new(&project_root);
+        match bypass.probe(&url, &referer, &cookie).await {
+            Ok(d) => d,
+            Err(e) => precheck_fail!(format!("playlist 预检失败 (CF bypass): {:#}", e)),
+        }
+    } else {
+        match video_processor::download_with_retry(&client, &url, 120, 1, 1, None).await {
+            Ok(d) => d,
+            Err(e) => precheck_fail!(format!("playlist 下载失败: {:#}", e)),
+        }
     };
     let playlist_text = match png_stream::decode_resource(&raw) {
         Ok(png_stream::PngStreamResource::Playlist(text)) => text,
@@ -352,7 +367,14 @@ async fn handle_download(
         ),
         Err(e) => precheck_fail!(format!("playlist 资源解析失败: {:#}", e)),
     };
-    let kind = classify_playlist(&playlist_text);
+    // CF 防护域名（surrit 等）为标准 HLS：分片伪装成 .jpeg 扩展名会误判为 PNG 伪装流，
+    // 且其分片只能经 Python 通道下载——一律按标准 M3U8 处理，管线内部自动路由 CF bypass
+    let kind = if video_processor::cloudflare_bypass::CloudflareBypassDownloader::needs_bypass(&url)
+    {
+        PlaylistKind::StandardM3U8
+    } else {
+        classify_playlist(&playlist_text)
+    };
     let segment_count = match png_stream::parse_segment_urls(&playlist_text, &url) {
         Ok(list) => list.len(),
         Err(e) => precheck_fail!(format!("解析分片列表失败: {:#}", e)),

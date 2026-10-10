@@ -13,10 +13,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 /// 需要走 Cloudflare 旁路的域名列表（小写匹配）
-const CF_BYPASS_DOMAINS: &[&str] = &[
-    "surrit.com",
-    "fourhoi.com",
-];
+const CF_BYPASS_DOMAINS: &[&str] = &["surrit.com", "fourhoi.com"];
 
 /// Cloudflare 旁路下载器
 pub struct CloudflareBypassDownloader {
@@ -29,7 +26,10 @@ impl CloudflareBypassDownloader {
         let python_path = detect_python();
         let script_path = project_root.join("scripts/curl_cffi_downloader.py");
 
-        Self { python_path, script_path }
+        Self {
+            python_path,
+            script_path,
+        }
     }
 
     /// 判断 URL 是否需要走 Cloudflare 旁路
@@ -67,16 +67,20 @@ impl CloudflareBypassDownloader {
 
         let mut cmd = Command::new(&self.python_path);
         cmd.arg(&self.script_path)
-            .arg("--url").arg(m3u8_url)
-            .arg("--referer").arg(referer)
-            .arg("--output").arg(&output_str)
-            .arg("--work-dir").arg(&work_dir_str)
-            .arg("--concurrent").arg("24");
+            .arg("--url")
+            .arg(m3u8_url)
+            .arg("--referer")
+            .arg(referer)
+            .arg("--output")
+            .arg(&output_str)
+            .arg("--work-dir")
+            .arg(&work_dir_str)
+            .arg("--concurrent")
+            .arg("24");
         if !cookie.is_empty() {
             cmd.arg("--cookie").arg(cookie);
         }
-        cmd.stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         log::info!("[CF Bypass] Python: {}", self.python_path.display());
         log::info!("[CF Bypass] URL: {}", m3u8_url);
@@ -122,6 +126,92 @@ impl CloudflareBypassDownloader {
         }
         log::info!("[CF Bypass] ✓ 下载完成: {}", output.display());
         Ok(())
+    }
+
+    /// 预检探针：仅下载 URL 内容并返回原始字节（明文 m3u8 / PNG 伪装资源）。
+    ///
+    /// server 预检用——CF 防护域名上 reqwest 会被盾拦截（403 challenge），
+    /// 必须走 curl-cffi。stdout 收原始字节，stderr 收日志（失败时带回显）。
+    pub async fn probe(&self, url: &str, referer: &str, cookie: &str) -> Result<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+        if !self.python_path.exists() {
+            return Err(anyhow!(
+                "Python 解释器未找到: {}（请 pip install curl-cffi，或设置 PYTHON 环境变量）",
+                self.python_path.display()
+            ));
+        }
+        if !self.script_path.exists() {
+            return Err(anyhow!("脚本不存在: {}", self.script_path.display()));
+        }
+
+        let mut cmd = Command::new(&self.python_path);
+        cmd.arg(&self.script_path)
+            .arg("--url")
+            .arg(url)
+            .arg("--referer")
+            .arg(referer)
+            .arg("--probe");
+        if !cookie.is_empty() {
+            cmd.arg("--cookie").arg(cookie);
+        }
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().context("启动 Python 预检进程失败")?;
+        let mut stdout = child.stdout.take().context("无 stdout")?;
+        let mut stderr = child.stderr.take().context("无 stderr")?;
+
+        // 并行读两个管道，防止缓冲区写满导致子进程卡死；整体 60s 超时
+        let out_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            stdout.read_to_end(&mut buf).await.map(|_| buf)
+        });
+        let err_task = tokio::spawn(async move {
+            let mut s = String::new();
+            stderr.read_to_string(&mut s).await.map(|_| s)
+        });
+        let (out, err, status) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let o = out_task.await;
+            let e = err_task.await;
+            let st = child.wait().await;
+            (o, e, st)
+        })
+        .await
+        .map_err(|_| {
+            // 超时后杀掉子进程，避免僵尸进程
+            let _ = child.start_kill();
+            anyhow!("CF 预检超时（60s）")
+        })?;
+
+        let err = err
+            .map_err(|e| anyhow!("读取预检 stderr 失败: {}", e))?
+            .unwrap_or_default();
+        let status = status.context("等待 Python 预检进程失败")?;
+        if !status.success() {
+            // 截取 stderr 尾部关键错误（含脚本打印的 HTTP 状态码）
+            let tail: String = err
+                .lines()
+                .rev()
+                .take(3)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join(" | ");
+            return Err(anyhow!(
+                "预检退出码 {}: {}",
+                status.code().unwrap_or(-1),
+                tail
+            ));
+        }
+        let out = out
+            .map_err(|e| anyhow!("读取预检输出失败: {}", e))?
+            .unwrap_or_default();
+        if out.is_empty() {
+            return Err(anyhow!("预检返回空内容"));
+        }
+        Ok(out)
     }
 }
 

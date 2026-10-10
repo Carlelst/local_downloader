@@ -375,8 +375,22 @@ pub async fn process_m3u8_batch(
                 .map(str::to_string)
                 .unwrap_or_else(|| get_referer_for_url(m3u8_url, &config));
             let url_cookie = get_cookie_for_url(m3u8_url, &config);
-            // 智能命名：优先用 URL 中的 UUID，回退到 MD5
-            let base_filename = extract_video_id(m3u8_url);
+            // 输出命名与标准分支一致：优先语义名（插件标题），否则 URL 智能提取，
+            // 一律附加 URL 短哈希防撞（清理/断点缓存都按这个名字找）
+            let base_filename = {
+                let hash = format!("{:x}", md5::compute(m3u8_url));
+                match display_name
+                    .map(sanitize_filename)
+                    .filter(|s| !s.is_empty())
+                {
+                    Some(clean) => format!("{}_{}", clean, &hash[..hash.len().min(8)]),
+                    None => format!(
+                        "{}_{}",
+                        extract_video_id(m3u8_url),
+                        &hash[..hash.len().min(8)]
+                    ),
+                }
+            };
             let output_path = download_dir.join(format!("{}.mp4", base_filename));
             match downloader
                 .download(m3u8_url, &url_referer, &url_cookie, &output_path)
