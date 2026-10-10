@@ -4,7 +4,41 @@ use log::{debug, error, info};
 use rand::{distributions::Alphanumeric, Rng};
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::OnceLock;
 use tokio::process::Command;
+
+/// ffmpeg 可执行文件路径（进程内缓存，首次调用时解析）
+static FFMPEG_BIN: OnceLock<String> = OnceLock::new();
+
+/// 解析 ffmpeg 路径：launchd 等受限 PATH 环境（只有 /usr/bin:/bin）下
+/// `Command::new("ffmpeg")` 会直接 ENOENT，必须 fallback 到常见安装位置
+pub fn ffmpeg_bin() -> String {
+    FFMPEG_BIN
+        .get_or_init(|| {
+            // 1) PATH 中查找（CLI / 交互 shell 环境）
+            if let Ok(out) = std::process::Command::new("which").arg("ffmpeg").output() {
+                if out.status.success() {
+                    let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !p.is_empty() {
+                        return p;
+                    }
+                }
+            }
+            // 2) launchd 等受限环境的常见安装位置
+            for c in [
+                "/opt/homebrew/bin/ffmpeg",
+                "/usr/local/bin/ffmpeg",
+                "/usr/bin/ffmpeg",
+            ] {
+                if Path::new(c).exists() {
+                    return c.to_string();
+                }
+            }
+            // 3) 兜底交给系统解析（报错信息保持原样便于排查）
+            "ffmpeg".to_string()
+        })
+        .clone()
+}
 
 /// 检测系统中可用的硬件加速器
 async fn detect_hw_accel() -> Option<&'static str> {
@@ -17,7 +51,7 @@ async fn detect_hw_accel() -> Option<&'static str> {
     ];
 
     for name in platforms.iter() {
-        let check = Command::new("ffmpeg")
+        let check = Command::new(ffmpeg_bin())
             .arg("-hide_banner")
             .arg("-loglevel")
             .arg("error")
@@ -97,7 +131,7 @@ pub async fn start_ffmpeg(
         threads as i32
     };
 
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(ffmpeg_bin());
 
     // 基本参数
     cmd.arg("-y");

@@ -1,15 +1,12 @@
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 use anyhow::{anyhow, Context, Result};
-use log::{debug, warn};
-use rayon::prelude::*;
+use log::debug;
 use std::time::Instant;
 
 use crate::domain::entities::{EncryptionInfo, EncryptionMethod};
 
 type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
-
-const CHUNK_SIZE: usize = 1024 * 1024; // 1MB per thread
 
 /// AES-128-CBC解密功能（向后兼容函数）
 ///
@@ -91,104 +88,29 @@ fn decrypt_aes128_segment(data: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>>
     let start_time = Instant::now();
     let total_bytes = data.len();
 
-    // 按块大小划分数据
-    if total_bytes > CHUNK_SIZE * 2 {
-        // 对大数据使用并行处理
-        debug!("使用并行解密处理 {} 字节的数据", total_bytes);
-        let result = parallel_decrypt(data, key, iv)?;
-        let elapsed = start_time.elapsed();
-        debug!(
-            "并行解密 {} 字节完成，用时: {:.2?}，速度: {:.2} MB/s",
-            total_bytes,
-            elapsed,
-            (total_bytes as f64 / 1024.0 / 1024.0) / elapsed.as_secs_f64()
-        );
-        Ok(result)
-    } else {
-        // 对小数据使用单线程处理
-        let result = simple_decrypt(data, key, iv)?;
-        let elapsed = start_time.elapsed();
-        debug!("单线程解密 {} 字节完成，用时: {:.2?}", total_bytes, elapsed);
-        Ok(result)
-    }
+    // 统一走单线程解密：AES-NI 硬件加速下 CBC 解密速度为 GB/s 级，
+    // 2-4MB 的 HLS 分片解密耗时 <5ms，并行分块毫无收益。
+    // （历史教训：旧的 >2MB 并行分块实现在中间块上做 PKCS7 校验必然失败，
+    //   失败后回退返回密文，导致大分片"解密"输出仍是密文）
+    let result = simple_decrypt(data, key, iv)?;
+    let elapsed = start_time.elapsed();
+    debug!("解密 {} 字节完成，用时: {:.2?}", total_bytes, elapsed);
+    Ok(result)
 }
 
-/// 简单的单线程解密
+/// 单线程 AES-128-CBC 解密（含 PKCS7 去填充）
 fn simple_decrypt(data: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>> {
     // 创建解密器
     let cipher = Aes128CbcDec::new_from_slices(key, iv).context("创建解密器失败")?;
 
-    // 解密数据 - 尝试带填充的解密
-    match cipher.decrypt_padded_vec_mut::<Pkcs7>(data) {
-        Ok(decrypted) => Ok(decrypted),
-        Err(_) => {
-            // 如果填充失败，返回原始数据
-            Ok(data.to_vec())
-        }
-    }
-}
-
-/// 使用rayon并行处理大型数据
-fn parallel_decrypt(data: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>> {
-    // 确保数据大小是16字节的倍数（AES块大小）
-    if data.len() % 16 != 0 {
-        warn!("数据长度不是16字节的倍数，这可能影响解密结果");
-    }
-
-    // 计算块数（以CHUNK_SIZE为单位）
-    let chunk_count = data.len().div_ceil(CHUNK_SIZE);
-    debug!("将数据分成 {} 个块进行并行解密", chunk_count);
-
-    // 对于CBC模式，每个块需要前一个块的最后16字节作为IV
-    // 所以我们需要稍微重叠分块
-    let chunks: Vec<_> = (0..chunk_count)
-        .map(|i| {
-            let start = if i == 0 { 0 } else { i * CHUNK_SIZE - 16 };
-            let end = std::cmp::min((i + 1) * CHUNK_SIZE, data.len());
-            (i, &data[start..end])
-        })
-        .collect();
-
-    // 并行解密每个块
-    let mut decrypted_chunks: Vec<_> = chunks
-        .par_iter() // 使用并行迭代器
-        .map(|(i, chunk)| {
-            let chunk_iv = if *i == 0 {
-                // 第一块使用原始IV
-                iv.to_vec()
-            } else {
-                // 后续块使用前一个密文块的最后16字节作为IV
-                let prev_block_end = *i * CHUNK_SIZE - 16;
-                data[prev_block_end..prev_block_end + 16].to_vec()
-            };
-
-            // 创建解密器
-            match Aes128CbcDec::new_from_slices(key, &chunk_iv) {
-                Ok(cipher) => {
-                    // 解密当前块
-                    let data_to_decrypt = if *i == 0 { chunk } else { &chunk[16..] };
-
-                    match cipher.decrypt_padded_vec_mut::<Pkcs7>(data_to_decrypt) {
-                        Ok(decrypted) => Ok((*i, decrypted)),
-                        Err(_) => {
-                            // 如果填充失败，返回原始数据
-                            Ok((*i, data_to_decrypt.to_vec()))
-                        }
-                    }
-                }
-                Err(e) => Err(anyhow!("为块 {} 创建解密器失败: {:?}", i, e)),
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    // 按顺序合并解密后的块
-    decrypted_chunks.sort_by_key(|(i, _)| *i);
-    let mut result = Vec::with_capacity(data.len());
-    for (_, chunk) in decrypted_chunks {
-        result.extend_from_slice(&chunk);
-    }
-
-    Ok(result)
+    // 解密数据（PKCS7 填充校验失败 = key/IV 错误或数据被截断/污染，必须报错，
+    // 绝不能把密文当明文返回——那会让下游把垃圾数据写进输出文件）
+    cipher.decrypt_padded_vec_mut::<Pkcs7>(data).map_err(|e| {
+        anyhow!(
+            "AES-128-CBC 解密失败（padding 校验不通过，数据损坏或 key/IV 错误）: {:?}",
+            e
+        )
+    })
 }
 
 /// 解密 AES-256 加密的片段数据
@@ -209,14 +131,7 @@ fn decrypt_aes256_segment(data: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>>
     let start_time = Instant::now();
     let total_bytes = data.len();
 
-    let result = if total_bytes > CHUNK_SIZE * 2 {
-        // 对大数据使用并行处理
-        debug!("使用并行解密处理 {} 字节的AES-256数据", total_bytes);
-        parallel_decrypt_aes256(data, key, iv)?
-    } else {
-        // 对小数据使用单线程处理
-        simple_decrypt_aes256(data, key, iv)?
-    };
+    let result = simple_decrypt_aes256(data, key, iv)?;
 
     let elapsed = start_time.elapsed();
     debug!(
@@ -226,78 +141,18 @@ fn decrypt_aes256_segment(data: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>>
     Ok(result)
 }
 
-/// 简单的单线程AES-256解密
+/// 单线程 AES-256-CBC 解密（含 PKCS7 去填充）
 fn simple_decrypt_aes256(data: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>> {
     // 创建解密器
     let cipher = Aes256CbcDec::new_from_slices(key, iv).context("创建AES-256解密器失败")?;
 
-    // 解密数据 - 尝试带填充的解密
-    match cipher.decrypt_padded_vec_mut::<Pkcs7>(data) {
-        Ok(decrypted) => Ok(decrypted),
-        Err(_) => {
-            // 如果填充失败，返回原始数据
-            Ok(data.to_vec())
-        }
-    }
-}
-
-/// 使用rayon并行处理大型AES-256数据
-fn parallel_decrypt_aes256(data: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>> {
-    // 确保数据大小是16字节的倍数（AES块大小）
-    if data.len() % 16 != 0 {
-        warn!("数据长度不是16字节的倍数，这可能影响AES-256解密结果");
-    }
-
-    // 计算块数（以CHUNK_SIZE为单位）
-    let chunk_count = data.len().div_ceil(CHUNK_SIZE);
-    debug!("将AES-256数据分成 {} 个块进行并行解密", chunk_count);
-
-    // 对于CBC模式，每个块需要前一个块的最后16字节作为IV
-    let chunks: Vec<_> = (0..chunk_count)
-        .map(|i| {
-            let start = if i == 0 { 0 } else { i * CHUNK_SIZE - 16 };
-            let end = std::cmp::min((i + 1) * CHUNK_SIZE, data.len());
-            (i, &data[start..end])
-        })
-        .collect();
-
-    // 并行解密每个块
-    let mut decrypted_chunks: Vec<_> = chunks
-        .par_iter()
-        .map(|(i, chunk)| {
-            let chunk_iv = if *i == 0 {
-                iv.to_vec()
-            } else {
-                let prev_block_end = *i * CHUNK_SIZE - 16;
-                data[prev_block_end..prev_block_end + 16].to_vec()
-            };
-
-            // 创建AES-256解密器
-            match Aes256CbcDec::new_from_slices(key, &chunk_iv) {
-                Ok(cipher) => {
-                    let data_to_decrypt = if *i == 0 { chunk } else { &chunk[16..] };
-
-                    match cipher.decrypt_padded_vec_mut::<Pkcs7>(data_to_decrypt) {
-                        Ok(decrypted) => Ok((*i, decrypted)),
-                        Err(_) => {
-                            // 如果填充失败，返回原始数据
-                            Ok((*i, data_to_decrypt.to_vec()))
-                        }
-                    }
-                }
-                Err(e) => Err(anyhow!("为块 {} 创建AES-256解密器失败: {:?}", i, e)),
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    // 按顺序合并解密后的块
-    decrypted_chunks.sort_by_key(|(i, _)| *i);
-    let mut result = Vec::with_capacity(data.len());
-    for (_, chunk) in decrypted_chunks {
-        result.extend_from_slice(&chunk);
-    }
-
-    Ok(result)
+    // 同 AES-128：padding 校验失败必须报错，不能把密文当明文返回
+    cipher.decrypt_padded_vec_mut::<Pkcs7>(data).map_err(|e| {
+        anyhow!(
+            "AES-256-CBC 解密失败（padding 校验不通过，数据损坏或 key/IV 错误）: {:?}",
+            e
+        )
+    })
 }
 
 /// 解密 SAMPLE-AES 加密的片段数据

@@ -296,7 +296,7 @@ async fn process_media_playlist(
                 };
 
                 // 下载密钥
-                debug!("从 URL 获取 AES 密钥: {}", key_url);
+                info!("从 URL 获取 AES 密钥: {}", key_url);
                 let aes_key = match timeout(Duration::from_secs(5), client.get(&key_url).send())
                     .await
                 {
@@ -320,7 +320,11 @@ async fn process_media_playlist(
                                 warn!("AES 密钥长度异常: {} 字节，期望 16 字节", key_bytes.len());
                             }
 
-                            info!("成功获取 AES 密钥，长度: {} 字节", key_bytes.len());
+                            info!(
+                                "成功获取 AES 密钥，长度: {} 字节, 前 4 字节: {:02x?}",
+                                key_bytes.len(),
+                                &key_bytes[..key_bytes.len().min(4)]
+                            );
                             Some(key_bytes)
                         }
                         Err(e) => {

@@ -9,6 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::RwLock;
 
+use crate::ffmpeg::ffmpeg_bin;
 use crate::{decrypt_segment, download_with_retry};
 
 const REPORT_INTERVAL: Duration = Duration::from_secs(30);
@@ -21,7 +22,7 @@ const JPEG_CONVERT_TIMEOUT: Duration = Duration::from_secs(30);
 /// - 已知性能瓶颈：未来可通过长生命周期 ffmpeg + 自定义协议优化
 /// - 已加 30s 超时，防止 ffmpeg 异常卡死冻死 segment worker
 async fn convert_jpeg_to_ts(jpeg_data: &[u8]) -> Result<Vec<u8>> {
-    let mut child = tokio::process::Command::new("ffmpeg")
+    let mut child = tokio::process::Command::new(ffmpeg_bin())
         .arg("-y")
         .arg("-f")
         .arg("image2pipe")

@@ -16,6 +16,8 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>RUST_LOG</key><string>info</string>
+        <!-- launchd 默认 PATH 没有 homebrew，显式补齐（ffmpeg 在 /opt/homebrew/bin） -->
+        <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
     <key>StandardOutPath</key><string>/Users/lst/hub/tools/local_downloader/logs/server.log</string>
     <key>StandardErrorPath</key><string>/Users/lst/hub/tools/local_downloader/logs/server.err.log</string>
