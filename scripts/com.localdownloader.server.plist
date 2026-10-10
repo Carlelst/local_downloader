@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.localdownloader.server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/lst/hub/tools/local_downloader/target/release/video_processor</string>
+        <string>--server</string>
+    </array>
+    <!-- server 按相对路径读 config.yaml，必须固定工作目录 -->
+    <key>WorkingDirectory</key><string>/Users/lst/hub/tools/local_downloader</string>
+    <!-- 登录时启动，进程退出/崩溃自动拉起 -->
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key><string>info</string>
+    </dict>
+    <key>StandardOutPath</key><string>/Users/lst/hub/tools/local_downloader/logs/server.log</string>
+    <key>StandardErrorPath</key><string>/Users/lst/hub/tools/local_downloader/logs/server.err.log</string>
+</dict>
+</plist>
