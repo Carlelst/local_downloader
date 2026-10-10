@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         rou.video 悬浮球下载器
 // @namespace    https://rou.video/
-// @version      2.2.6
+// @version      2.2.7
 // @description  在 rou.video / missav 播放页右下角显示悬浮球：自动捕获视频地址并暂存为任务（跨页面持久化），点击球打开管理面板：批量发送下载、实时查看服务端进度、取消/重试、手动添加地址
 // @match        https://rou.video/*
 // @match        https://www.rou.video/*
@@ -33,6 +33,9 @@
 
     const SERVER = 'http://127.0.0.1:7777';
     const TASKS_KEY = 'rd_tasks_v2';
+    // 自更新：拉取 raw 脚本比对版本号（Tampermonkey 原生更新约每天一次，这里主动即时发现）
+    const SCRIPT_URL = 'https://raw.githubusercontent.com/Carlelst/local_downloader/master/userscripts/rou-downloader.user.js';
+    const SCRIPT_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '';
     // 伪装 playlist 的请求模式：/hls/<id>/<variant>/index.png|jpg（带认证 query）
     const PLAYLIST_RE = /\/hls\/[^/?#\s]+\/[^/?#\s]+\/index\.(png|jpg)\?/i;
     // 标准 m3u8（missav 等，hls.js 的 XHR/fetch 请求）
@@ -155,6 +158,38 @@
     }
     function pendingCount() {
         return loadTasks().filter((t) => t.status === 'pending').length;
+    }
+
+    // ================= 自更新检查 =================
+    // 顶层定期拉 raw 脚本比对 @version；发现新版触发 onUpdateAvailable（mount 里
+    // 赋值为提示+面板按钮）。点击面板"更新"= 打开 raw 地址 → Tampermonkey 弹安装页
+    let newVer = '';
+    let onUpdateAvailable = null;
+    function cmpVer(a, b) {
+        const pa = String(a).split('.').map(Number), pb = String(b).split('.').map(Number);
+        for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+            const x = pa[i] || 0, y = pb[i] || 0;
+            if (x !== y) return x - y;
+        }
+        return 0;
+    }
+    function checkUpdate() {
+        if (!SCRIPT_VER || !IS_TOP) return;
+        try {
+            GM_xmlhttpRequest({
+                method: 'GET', url: SCRIPT_URL + '?check=' + Date.now(), timeout: 10000,
+                onload: (r) => {
+                    try {
+                        const m = (r.responseText || '').match(/@version\s+([\d.]+)/);
+                        if (m && cmpVer(m[1], SCRIPT_VER) > 0 && newVer !== m[1]) {
+                            newVer = m[1];
+                            console.log('[rou-dl] 检测到脚本新版本 v' + newVer + '（当前 v' + SCRIPT_VER + '）');
+                            if (onUpdateAvailable) { try { onUpdateAvailable(newVer); } catch (e) { /* 忽略 */ } }
+                        }
+                    } catch (e) { /* 忽略 */ }
+                },
+            });
+        } catch (e) { /* 忽略 */ }
     }
 
     // ================= 捕获（五层通道，与 v1.8 相同） =================
@@ -377,6 +412,8 @@
             .p-head .title { font-weight: 600; flex: 1; }
             .p-head .close { cursor: pointer; opacity: .85; font-size: 18px; line-height: 1; padding: 2px 6px; }
             .p-head .close:hover { opacity: 1; }
+            .p-head .upd { cursor: pointer; background: rgba(255,255,255,.22); border-radius: 10px; padding: 2px 10px; font-size: 12px; font-weight: 500; }
+            .p-head .upd:hover { background: rgba(255,255,255,.38); }
             .p-status { padding: 6px 16px; font-size: 12px; color: #666;
                         border-bottom: 1px solid #eee; display: flex; gap: 6px; align-items: center; }
             .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
@@ -467,6 +504,14 @@
             const input = panel.querySelector('#rd-url');
             if (panel.classList.contains('open') && shadow.activeElement !== input) renderPanel();
         };
+        // 新版本发现：提示 + 面板头部出现"更新"按钮；启动 8s 后检查，此后每 24h 一次
+        onUpdateAvailable = (v) => {
+            showTip('下载器脚本有新版本 v' + v + '，打开面板点击"更新"安装', '#ffd54f');
+            refreshBadge();
+            if (panel.classList.contains('open')) renderPanel();
+        };
+        setTimeout(checkUpdate, 8000);
+        setInterval(checkUpdate, 24 * 3600 * 1000);
 
         // ---- 管理面板 ----
         let selected = new Set();
@@ -609,6 +654,7 @@
             panel.innerHTML = `
                 <div class="p-head">
                     <span class="title">下载任务（${all.length}）</span>
+                    ${newVer ? `<span class="upd" id="rd-upd" title="打开 Tampermonkey 安装页">更新 v${newVer}</span>` : ''}
                     <span class="close" title="关闭">✕</span>
                 </div>
                 <div class="p-status" id="rd-status">
@@ -728,6 +774,8 @@
             panel.querySelector('#rd-dl').onclick = () => batchSend();
             panel.querySelector('#rd-add').onclick = addManually;
             panel.querySelector('#rd-url').onkeydown = (e) => { if (e.key === 'Enter') addManually(); };
+            const updBtn = panel.querySelector('#rd-upd');
+            if (updBtn) updBtn.onclick = () => { window.open(SCRIPT_URL + '?install=' + Date.now(), '_blank'); };
             panel.querySelector('#rd-scan').onclick = async () => {
                 const b = panel.querySelector('#rd-scan');
                 b.disabled = true; b.textContent = '扫描中…';
