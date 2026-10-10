@@ -385,8 +385,8 @@ pub async fn download_png_stream(
         return Err(anyhow!("任务已取消"));
     }
 
-    // 4. 按序写入 FFmpeg
-    let (mut ffmpeg, output_file) = start_ffmpeg(config, SegmentFormat::Ts).await?;
+    // 4. 按序写入 FFmpeg（输出文件名直接用调用方的语义化防撞名，无需事后重命名）
+    let (mut ffmpeg, output_file) = start_ffmpeg(config, SegmentFormat::Ts, output_name).await?;
     let write_result: Result<()> = async {
         let stdin = ffmpeg
             .stdin
@@ -419,18 +419,8 @@ pub async fn download_png_stream(
 
     match ffmpeg.wait().await {
         Ok(status) if status.success() => {
-            // start_ffmpeg 用随机文件名，成功后重命名为语义化名称（防撞命名由调用方负责）
-            let final_path = PathBuf::from(&config.output_directory)
-                .join(format!("{}.{}", output_name, config.video_format));
-            if let Err(e) = tokio::fs::rename(&output_file, &final_path).await {
-                warn!(
-                    "重命名输出文件失败 ({} -> {}): {}，保留随机名",
-                    output_file,
-                    final_path.display(),
-                    e
-                );
-                return Ok(PathBuf::from(&output_file));
-            }
+            // start_ffmpeg 已按语义化名称输出，无需重命名
+            let final_path = PathBuf::from(&output_file);
             info!("PNG 伪装流下载完成: {}", final_path.display());
             Ok(final_path)
         }

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         rou.video 悬浮球下载器
 // @namespace    https://rou.video/
-// @version      2.4.1
+// @version      2.4.2
 // @description  全站通用视频地址捕获器：自动捕获 m3u8/伪装流地址并暂存为任务（跨页面持久化），点击球打开管理面板：批量发送下载、实时查看服务端进度、取消/重试、手动添加地址。悬浮球默认隐藏——本页捕获到视频地址或按 Alt+V 后出现
 // @match        *://*/*
 // @run-at       document-start
@@ -101,6 +101,10 @@
             } catch (e) { t = document.title || ''; }
             t = (t || '').trim();
             t = t.replace(/^\s*(在线播放|立即播放|播放|正片|高清播放)\s*[-|–:：]\s*/i, '');
+            // maccms 系站点用下划线连缀的功能页后缀（如 "xxx_在线播放_线上观看_视频下载_AvGood"）：
+            // 两侧都有下划线的标记词才算后缀起点（避免误伤标题本身含"在线播放"等词的场景）
+            const junk = t.search(/_(在线播放|线上观看|视频下载|免费观看|抢先观看)_/i);
+            if (junk > 0) t = t.slice(0, junk);
             t = t.replace(/\s*[-|–]\s*(rou\.video|missav[\w.]*|www\.[\w.]+)\s*$/i, '').trim();
             return t.length > 120 ? t.slice(0, 120) : t;
         } catch (e) { return ''; }

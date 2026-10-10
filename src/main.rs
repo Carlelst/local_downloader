@@ -112,10 +112,10 @@ fn extract_png_video_id(url: &str) -> String {
             .unwrap_or_default();
         for seg in segments.iter().rev() {
             let lower = seg.to_ascii_lowercase();
-            let is_image_file = [".png", ".jpg", ".jpeg", ".webp", ".gif"]
+            let is_image_file = [".png", ".jpg", ".jpeg", ".webp", ".gif", ".m3u8"]
                 .iter()
                 .any(|ext| lower.ends_with(ext));
-            if is_image_file || is_resolution(&lower) {
+            if is_image_file || is_resolution(&lower) || lower == "ts" {
                 continue;
             }
             return sanitize_filename(seg);
@@ -791,8 +791,10 @@ pub async fn process_m3u8_batch(
             });
         }
 
-        // 获取FFmpeg进程
-        let (mut ffmpeg, output_file) = start_ffmpeg(&config, segment_format).await?;
+        // 获取FFmpeg进程（输出文件名用管线语义化防撞名：{标题|URL段}_{md5前8}，
+        // 与断点缓存/服务端清理/孤儿回收的 base 命名保持一致）
+        let (mut ffmpeg, output_file) =
+            start_ffmpeg(&config, segment_format, &base_filename).await?;
         let ffmpeg_stdin = ffmpeg
             .stdin
             .as_mut()

@@ -87,12 +87,16 @@ async fn detect_hw_accel() -> Option<&'static str> {
 /// # 参数
 /// - `config`: 应用程序配置
 /// - `segment_format`: 片段格式（MPEG-TS 或 fMP4）
+/// - `base_name`: 输出文件名（不含扩展名）。管线调用方必须传语义化防撞名
+///   （如 `{标题}_{md5前8}`）；此前该函数自行生成随机名，导致 m3u8 管线的
+///   视频标题命名、取消清理、孤儿缓存回收全部失效——那是"下载文件全是随机名"的根因
 ///
 /// # 返回
-/// 返回 tokio::process::Child 对象，或在失败时返回错误。
+/// 返回 (tokio::process::Child, 输出文件完整路径)，或在失败时返回错误。
 pub async fn start_ffmpeg(
     config: &Config,
     segment_format: SegmentFormat,
+    base_name: &str,
 ) -> Result<(tokio::process::Child, String)> {
     debug!("初始化 FFmpeg 进程");
 
@@ -103,13 +107,18 @@ pub async fn start_ffmpeg(
             .context("创建输出目录失败")?;
     }
 
-    // 生成随机的输出文件名
-    let random_filename: String = rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(10) // 随机字符串长度
-        .map(char::from)
-        .collect();
-    let output_filename = format!("{}.{}", random_filename, config.video_format);
+    // 输出文件名：调用方语义名优先，空值回退随机名（兜底防御）
+    let output_filename = if base_name.trim().is_empty() {
+        let random_filename: String = rand::thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(10)
+            .map(char::from)
+            .collect();
+        random_filename
+    } else {
+        base_name.trim().to_string()
+    };
+    let output_filename = format!("{}.{}", output_filename, config.video_format);
     let output_path = Path::new(&config.output_directory).join(&output_filename);
     let output_path_str = format!("{}", output_path.display());
 
