@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         rou.video 悬浮球下载器
 // @namespace    https://rou.video/
-// @version      2.2.7
+// @version      2.2.8
 // @description  在 rou.video / missav 播放页右下角显示悬浮球：自动捕获视频地址并暂存为任务（跨页面持久化），点击球打开管理面板：批量发送下载、实时查看服务端进度、取消/重试、手动添加地址
 // @match        https://rou.video/*
 // @match        https://www.rou.video/*
@@ -24,8 +24,8 @@
 // @connect      127.0.0.1
 // @connect      localhost
 // @connect      *
-// @updateURL    https://raw.githubusercontent.com/Carlelst/local_downloader/master/userscripts/rou-downloader.user.js
-// @downloadURL  https://raw.githubusercontent.com/Carlelst/local_downloader/master/userscripts/rou-downloader.user.js
+// @updateURL    http://127.0.0.1:7777/script.user.js
+// @downloadURL  http://127.0.0.1:7777/script.user.js
 // ==/UserScript==
 
 (function () {
@@ -33,8 +33,8 @@
 
     const SERVER = 'http://127.0.0.1:7777';
     const TASKS_KEY = 'rd_tasks_v2';
-    // 自更新：拉取 raw 脚本比对版本号（Tampermonkey 原生更新约每天一次，这里主动即时发现）
-    const SCRIPT_URL = 'https://raw.githubusercontent.com/Carlelst/local_downloader/master/userscripts/rou-downloader.user.js';
+    // 自更新：从本地 server 拉脚本比对版本（仓库私有，GitHub raw 不可用；server 托管最新脚本）
+    const SCRIPT_URL = 'http://127.0.0.1:7777/script.user.js';
     const SCRIPT_VER = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) || '';
     // 伪装 playlist 的请求模式：/hls/<id>/<variant>/index.png|jpg（带认证 query）
     const PLAYLIST_RE = /\/hls\/[^/?#\s]+\/[^/?#\s]+\/index\.(png|jpg)\?/i;

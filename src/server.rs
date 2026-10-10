@@ -8,6 +8,7 @@
 //! 端点：
 //! - `GET  /health`   存活探测
 //! - `GET  /status`   任务列表 JSON（面板轮询显示进度）：{"ok":true,"counts":{...},"tasks":[...]}
+//! - `GET  /script.user.js` 本地托管油猴脚本（私有仓库的更新分发，TM 从这里拉新版）
 //! - `OPTIONS *`      CORS 预检（含 Chrome PNA 要求的 Private-Network 头）
 //! - `POST /download` body: {"url": "..."} → {"ok": true, "segments": N} | 4xx {"ok": false, "error": "..."}
 //! - `POST /cancel`   body: {"url": "..."} 取消排队/下载中任务（下载中任务在分片检查点快速退出）
@@ -171,6 +172,21 @@ async fn handle_conn(
         ("GET", "/health") => {
             write_response(stream, 200, "OK", cors, r#"{"ok":true}"#).await?;
         }
+        // 本地脚本分发：私有仓库不出本机，Tampermonkey 原生更新 + 脚本自更新都走这里
+        ("GET", "/script.user.js") => match load_userscript() {
+            Ok(js) => write_response_ct(stream, 200, "OK", cors, "text/javascript", &js).await?,
+            Err(e) => {
+                warn!("/script.user.js: {:#}", e);
+                write_response(
+                    stream,
+                    404,
+                    "Not Found",
+                    cors,
+                    r#"{"ok":false,"error":"script not found"}"#,
+                )
+                .await?;
+            }
+        },
         ("GET", "/status") => {
             let text = handle_status(&tasks).await;
             write_response(stream, 200, "OK", cors, &text).await?;
@@ -609,18 +625,38 @@ async fn write_response(
     cors: &str,
     json: &str,
 ) -> Result<()> {
+    write_response_ct(stream, status, reason, cors, "application/json", json).await
+}
+
+/// 自定义 Content-Type 的响应（脚本分发用 text/javascript，Tampermonkey 按类型识别）
+async fn write_response_ct(
+    mut stream: TcpStream,
+    status: u16,
+    reason: &str,
+    cors: &str,
+    content_type: &str,
+    body: &str,
+) -> Result<()> {
     let resp = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json{}{}Content-Length: {}\r\n\r\n{}",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}{}{}Content-Length: {}\r\n\r\n{}",
         status,
         reason,
+        content_type,
         cors,
         "\r\n",
-        json.len(),
-        json
+        body.len(),
+        body
     );
     stream.write_all(resp.as_bytes()).await?;
     stream.flush().await?;
     Ok(())
+}
+
+/// 本地托管油猴脚本：仓库保持私有，Tampermonkey 从这里拉更新（不出本机）。
+/// 路径相对 server 工作目录（launchd WorkingDirectory = 项目根）
+fn load_userscript() -> Result<String> {
+    std::fs::read_to_string("userscripts/rou-downloader.user.js")
+        .context("读取 userscripts/rou-downloader.user.js 失败")
 }
 
 fn json_error(msg: &str) -> String {
