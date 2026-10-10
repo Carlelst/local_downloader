@@ -162,6 +162,10 @@ async fn handle_conn(
 ) -> Result<()> {
     let mut stream = stream;
     let (method, path, body) = read_request(&mut stream).await?;
+    // 客户端未发请求就断开（空 method），静默退出
+    if method.is_empty() {
+        return Ok(());
+    }
 
     // 所有响应统一带 CORS 头（浏览器 Private Network Access 要求回环地址响应带 PNA 头）
     let cors = "\r\nAccess-Control-Allow-Origin: *\r\n\
@@ -598,6 +602,11 @@ async fn read_request(stream: &mut TcpStream) -> Result<(String, String, Vec<u8>
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
     reader.read_line(&mut request_line).await?;
+    // 连接被客户端打开后未发任何数据就关闭（Chrome 预连接/keep-alive 空闲回收）
+    // 属正常断开，返回空 method 让调用方静默退出，不刷 WARN
+    if request_line.trim().is_empty() {
+        return Ok((String::new(), String::new(), Vec::new()));
+    }
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
     let path = parts.next().unwrap_or("").to_string();
