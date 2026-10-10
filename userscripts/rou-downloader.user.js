@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         rou.video 悬浮球下载器
 // @namespace    https://rou.video/
-// @version      2.3.0
+// @version      2.4.0
 // @description  全站通用视频地址捕获器：自动捕获 m3u8/伪装流地址并暂存为任务（跨页面持久化），点击球打开管理面板：批量发送下载、实时查看服务端进度、取消/重试、手动添加地址。悬浮球默认隐藏——本页捕获到视频地址或按 Alt+V 后出现
 // @match        *://*/*
 // @run-at       document-start
@@ -188,6 +188,7 @@
     let hostEl = null;      // shadow 宿主：通用模式下整体显隐（球默认隐藏，避免打扰非视频站点）
     let ballVisible = false; // 本页是否已显示球（首次捕获 或 Alt+V）
     let pollingStarter = null; // mount() 里赋值：角标/状态轮询的惰性启动器（球显示时才跑，全站注入下避免无谓请求）
+    let tipFn = null; // mount() 里赋值为 showTip：捕获/完成提醒从 mount 闭包外触发气泡
 
     // 显示悬浮球（通用模式：默认隐藏）。捕获路径（本页或 iframe postMessage）与 Alt+V 都会调用
     function showBall() {
@@ -210,8 +211,9 @@
             if (r === 'new') {
                 console.log('[rou-dl] ✓ 已捕获并暂存 (' + source + '):', clean);
                 showBall(); // 通用模式：本页首次捕获到视频地址才显示悬浮球
+                if (tipFn) tipFn('已捕获：' + (title || titleFromUrl(clean)), '#81c784');
                 notifyTasksChanged();
-                reportToTop(clean);
+                reportToTop(clean, title);
                 // 捕获发生时页面 title 可能尚未就绪（播放器 iframe 先加载/标题后设置），
                 // 延迟重试刷新标题（refresh 路径静默，只更新 title/url）
                 [2000, 6000].forEach((ms) => setTimeout(() => addTask(clean, pageTitle() || title), ms));
@@ -222,10 +224,10 @@
         }
     }
 
-    // 非顶层 frame：捕获后通知顶层立即刷新角标
-    function reportToTop(url) {
+    // 非顶层 frame：捕获后通知顶层立即刷新角标并弹出提示
+    function reportToTop(url, title) {
         if (IS_TOP) return;
-        try { window.parent.postMessage({ __rdCapture: url }, '*'); } catch (e) { /* 忽略 */ }
+        try { window.parent.postMessage({ __rdCapture: url, __rdTitle: title || '' }, '*'); } catch (e) { /* 忽略 */ }
     }
 
     // 从任意文本（JSON 响应/页面源码）里提取视频地址
@@ -487,6 +489,7 @@
             clearTimeout(showTip._t);
             showTip._t = setTimeout(() => (tip.style.display = 'none'), 5000);
         }
+        tipFn = showTip;
 
         // ---- 角标 ----
         function refreshBadge() {
@@ -520,10 +523,15 @@
         let sending = false;
         // 当前 tab：pending 待下载 / active 进行中 / done 已结束
         let curTab = 'active';
+        // 清空按钮两段式确认：第一次点击变为"确认清空?"，3s 内再点执行，超时自动复原
+        let clrArmed = false;
         // 服务端任务状态（GET /status 轮询）：url -> {state,segments,error,name}
         let serverTasks = {};
         let serverCounts = null;
         let lastStatusJson = '';
+        // 终态任务键集合（上一次轮询快照）：用于"下载完成/失败"气泡 diff，null=尚未基线
+        let lastDoneKeys = null;
+        let lastFailKeys = null;
         const SRV_ST = {
             queued: ['排队中', 'sending'],
             downloading: ['下载中', 'sending'],
@@ -653,6 +661,10 @@
                 active: '暂无进行中的任务<br>切到"待下载"勾选任务后点"下载选中"',
                 done: '暂无已结束的任务',
             }[curTab];
+            // 清空按钮按 tab 变语义：待下载=清空未发送条目；已结束=清本地记录+ forget 服务端终态；
+            // 进行中无批量动作（取消请用行内按钮），隐藏
+            const clrBtn = curTab === 'active' ? '' :
+                `<button id="rd-clr" class="danger">${clrArmed ? '确认清空?' : (curTab === 'pending' ? '清空待下载' : '清空已结束')}</button>`;
             panel.innerHTML = `
                 <div class="p-head">
                     <span class="title">下载任务（${all.length}）</span>
@@ -676,9 +688,9 @@
                 <div class="p-foot">
                     <button id="rd-sel">全选</button>
                     <button id="rd-scan" title="立刻重放 API / 扫描网络记录与源码">立即捕获</button>
-                    <button id="rd-clr" class="danger">清除已结束</button>
+                    ${clrBtn}
                     <span class="grow"></span>
-                    <button id="rd-dl" class="primary" ${sending ? 'disabled' : ''}>下载选中 (${selected.size})</button>
+                    <button id="rd-dl" class="primary" ${(sending || selected.size === 0) ? 'disabled' : ''}>下载选中 (${selected.size})</button>
                 </div>`;
             bindPanel();
             checkServer();
@@ -737,7 +749,7 @@
             panel.querySelector('.close').onclick = () => panel.classList.remove('open');
             // tab 切换（待下载/进行中/已结束）
             panel.querySelectorAll('.ptab').forEach((el) => {
-                el.onclick = () => { curTab = el.dataset.tab; selected.clear(); renderPanel(); };
+                el.onclick = () => { curTab = el.dataset.tab; selected.clear(); clrArmed = false; renderPanel(); };
             });
             panel.querySelectorAll('.item').forEach((el) => {
                 const id = el.dataset.id;
@@ -746,7 +758,9 @@
                 if (cb && !cb.disabled) {
                     cb.onchange = (e) => {
                         if (e.target.checked) selected.add(id); else selected.delete(id);
-                        panel.querySelector('#rd-dl').textContent = `下载选中 (${selected.size})`;
+                        const dl = panel.querySelector('#rd-dl');
+                        dl.textContent = `下载选中 (${selected.size})`;
+                        dl.disabled = sending || selected.size === 0;
                     };
                     el.querySelector('.del').onclick = () => { removeTasks([id]); selected.delete(id); renderPanel(); };
                 } else {
@@ -769,9 +783,37 @@
                 else cand.forEach((id) => selected.add(id));
                 renderPanel();
             };
-            panel.querySelector('#rd-clr').onclick = () => {
-                removeTasks(loadTasks().filter((t) => t.status === 'sent' || t.status === 'failed').map((t) => t.id));
-                renderPanel();
+            // 清空（两段式确认）：待下载 tab 删未发送条目；已结束 tab 删本地记录
+            // 并把服务端终态任务逐个 forget（否则 srvOnly 残留行永远占着列表）
+            const clrBtnEl = panel.querySelector('#rd-clr');
+            if (clrBtnEl) clrBtnEl.onclick = () => {
+                if (!clrArmed) {
+                    clrArmed = true;
+                    renderPanel();
+                    setTimeout(() => {
+                        if (clrArmed) { clrArmed = false; if (panel.classList.contains('open')) renderPanel(); }
+                    }, 3000);
+                    return;
+                }
+                clrArmed = false;
+                if (curTab === 'pending') {
+                    const ids = loadTasks().filter((t) => t.status === 'pending').map((t) => t.id);
+                    removeTasks(ids);
+                    selected.clear();
+                    notifyTasksChanged();
+                    renderPanel();
+                    showTip(`已清空 ${ids.length} 个待下载任务`, '#81c784');
+                } else {
+                    removeTasks(loadTasks().filter((t) => t.status === 'sent' || t.status === 'failed').map((t) => t.id));
+                    selected.clear();
+                    const endUrls = Object.values(serverTasks)
+                        .filter((sv) => ['done', 'failed', 'cancelled'].includes(sv.state))
+                        .map((sv) => sv.url);
+                    endUrls.forEach((u) => doAction('forget', u));
+                    notifyTasksChanged();
+                    renderPanel();
+                    showTip('已清空已结束记录' + (endUrls.length ? `（含服务端 ${endUrls.length} 条）` : ''), '#81c784');
+                }
             };
             panel.querySelector('#rd-dl').onclick = () => batchSend();
             panel.querySelector('#rd-add').onclick = addManually;
@@ -812,6 +854,24 @@
                             (d.tasks || []).forEach((t) => { map[videoKey(t.url)] = t; });
                             serverTasks = map;
                             serverCounts = d.counts || {};
+                            // 终态变化 → 气泡提醒（面板关着也能感知下载结果）。
+                            // lastDone/lastFailed 初始为空：首次轮询不提示历史任务
+                            const doneKeys = new Set(Object.keys(map).filter((k) => map[k].state === 'done'));
+                            const failKeys = new Set(Object.keys(map).filter((k) => ['failed', 'cancelled'].includes(map[k].state)));
+                            if (lastDoneKeys) {
+                                const freshDone = [...doneKeys].filter((k) => !lastDoneKeys.has(k));
+                                if (freshDone.length && tipFn) {
+                                    tipFn('✓ 下载完成：' + freshDone.map((k) => map[k].name || '').join('、').slice(0, 100), '#81c784');
+                                }
+                            }
+                            if (lastFailKeys) {
+                                const freshFail = [...failKeys].filter((k) => !lastFailKeys.has(k));
+                                if (freshFail.length && tipFn) {
+                                    tipFn('✗ 下载失败：' + freshFail.map((k) => (map[k].name || '') + (map[k].error ? '（' + map[k].error.slice(0, 40) + '）' : '')).join('、').slice(0, 120), '#ffb74d');
+                                }
+                            }
+                            lastDoneKeys = doneKeys;
+                            lastFailKeys = failKeys;
                             const snap = JSON.stringify([serverTasks, serverCounts]);
                             if (snap !== lastStatusJson) {
                                 lastStatusJson = snap;
@@ -826,6 +886,7 @@
                 onerror: () => {
                     if (serverCounts) {
                         serverTasks = {}; serverCounts = null; lastStatusJson = '';
+                        lastDoneKeys = null; lastFailKeys = null;
                         if (panel.classList.contains('open')) renderPanel();
                     }
                 },
@@ -887,6 +948,8 @@
                 renderPanel();
             }
             sending = false;
+            // 全部成功 → 自动切到"进行中"让用户直接看到入队结果；有失败留在当前 tab 方便重试
+            if (okCount > 0 && failCount === 0) { curTab = 'active'; renderPanel(); }
             showTip(
                 `批量发送完成：${okCount} 成功${failCount ? '，' + failCount + ' 失败（详情见面板）' : ''}` +
                 (skipCount ? `，${skipCount} 个已入队任务已跳过` : ''),
@@ -947,6 +1010,11 @@
         if (document.documentElement) startObserver();
         else document.addEventListener('DOMContentLoaded', startObserver, { once: true });
 
+        // Esc 关闭面板
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && panel.classList.contains('open')) panel.classList.remove('open');
+        });
+
         // 角标轮询：其他页面/frame 写入 GM 存储后这里也能看到（GM 存储全局共享）。
         // 通用模式（全站注入）下惰性启动：球显示后才轮询，避免每个网站都打本地服务
         pollingStarter = (() => {
@@ -973,6 +1041,7 @@
             const d = e.data;
             if (d && typeof d === 'object' && d.__rdCapture) {
                 showBall(); // iframe 捕获到视频 → 顶层也显示球
+                if (tipFn && d.__rdTitle) tipFn('已捕获：' + d.__rdTitle, '#81c784');
                 notifyTasksChanged();
             }
         });
