@@ -34,6 +34,9 @@ referers:
   11yun.space: "https://kanav.ad/"
   # 91quanji.com 的 m3u8 CDN（域名含随机段，可能轮换；换了抓新 curl 报给我）
   s8jamrmtps5.sbs: "https://91quanji.com/"
+  # avgood.com：m3u8 与分片同域自托管（remote_m3u8 路径，AES-128 + t=小时级签名），
+  # 必须带自身 Referer，且站点在 CF 后需走系统代理
+  avgood.com: "https://avgood.com/"
   # rou.video 家族伪装流 CDN：节点域名常变（fuzb14/gokj68/monb18/rn245/cexd14... 均为 *.xyz）
   # 通配符 *.xyz 覆盖所有 xyz 节点；如遇需不同 Referer 的 xyz 站点，用具体域名条目覆盖（优先级更高）
   "*.xyz": "https://rou.video/"
