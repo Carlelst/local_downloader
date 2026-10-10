@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         rou.video 悬浮球下载器
 // @namespace    https://rou.video/
-// @version      2.4.0
+// @version      2.4.1
 // @description  全站通用视频地址捕获器：自动捕获 m3u8/伪装流地址并暂存为任务（跨页面持久化），点击球打开管理面板：批量发送下载、实时查看服务端进度、取消/重试、手动添加地址。悬浮球默认隐藏——本页捕获到视频地址或按 Alt+V 后出现
 // @match        *://*/*
 // @run-at       document-start
@@ -511,6 +511,8 @@
         };
         // 新版本发现：提示 + 面板头部出现"更新"按钮；启动 8s 后检查，此后每 24h 一次
         onUpdateAvailable = (v) => {
+            // 通用模式球默认隐藏：提示气泡挂在 host 里，不亮球等于没提示（v2.4.0 更新提醒丢失的根因）
+            showBall();
             showTip('下载器脚本有新版本 v' + v + '，打开面板点击"更新"安装', '#ffd54f');
             refreshBadge();
             if (panel.classList.contains('open')) renderPanel();
