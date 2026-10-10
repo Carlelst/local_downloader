@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         rou.video 悬浮球下载器
 // @namespace    https://rou.video/
-// @version      2.4.2
+// @version      2.4.3
 // @description  全站通用视频地址捕获器：自动捕获 m3u8/伪装流地址并暂存为任务（跨页面持久化），点击球打开管理面板：批量发送下载、实时查看服务端进度、取消/重试、手动添加地址。悬浮球默认隐藏——本页捕获到视频地址或按 Alt+V 后出现
 // @match        *://*/*
 // @run-at       document-start
@@ -405,13 +405,18 @@
                    background: rgba(0,0,0,.85); color: #fff; font: 13px/1.5 sans-serif;
                    display: none; box-shadow: 0 4px 16px rgba(0,0,0,.4); word-break: break-all; }
             .panel { position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
-                     width: 460px; min-width: 340px; max-width: 92vw; max-height: 78vh;
+                     width: 560px; min-width: 340px; max-width: 92vw; max-height: 78vh;
                      min-height: 220px; z-index: 2147483647;
                      background: #fff; color: #222; border-radius: 12px;
                      box-shadow: 0 12px 48px rgba(0,0,0,.35);
                      font: 13px/1.5 -apple-system, sans-serif;
                      display: none; flex-direction: column; overflow: hidden; resize: both; }
             .panel.open { display: flex; }
+            /* 原生缩放手柄不可见，右下角画个角标提示可拖拽调宽高（pointer-events:none 不挡手柄） */
+            .panel::after { content: ''; position: absolute; right: 3px; bottom: 3px; width: 12px; height: 12px;
+                            pointer-events: none;
+                            border-right: 2px solid #c3c9d4; border-bottom: 2px solid #c3c9d4;
+                            border-bottom-right-radius: 8px; }
             .p-head { padding: 12px 16px; background: #2b5fd9; color: #fff;
                       display: flex; align-items: center; gap: 8px; }
             .p-head .title { font-weight: 600; flex: 1; }
@@ -439,7 +444,9 @@
             .item:hover { background: #f7f9ff; }
             .item input[type=checkbox] { flex: none; }
             .item .info { flex: 1; min-width: 0; }
-            .item .t { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+            /* 长标题最多两行折行显示（超出省略），悬停可见完整名 */
+            .item .t { font-weight: 500; display: -webkit-box; -webkit-box-orient: vertical;
+                       -webkit-line-clamp: 2; overflow: hidden; word-break: break-all; }
             .item .meta { font-size: 11px; color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
             .item .st { flex: none; font-size: 11px; padding: 2px 8px; border-radius: 10px; }
             .st.pending { background: #fff3e0; color: #e65100; }
@@ -607,7 +614,7 @@
                 <div class="item" data-id="${t.id}" data-url="${esc(t.url)}">
                     <input type="checkbox" ${selected.has(t.id) ? 'checked' : ''}>
                     <div class="info">
-                        <div class="t" title="${esc(t.url)}">${esc(t.title)}</div>
+                        <div class="t" title="${esc(t.title || t.url)}">${esc(t.title)}</div>
                         <div class="meta">${esc(t.host)} · ${fmtTime(t.t)}${metaExtra}</div>
                         ${pgBar(sv)}
                     </div>
@@ -641,7 +648,7 @@
                 <div class="item srv" data-url="${esc(sv.url)}">
                     <input type="checkbox" disabled>
                     <div class="info">
-                        <div class="t" title="${esc(sv.url)}">${esc(sv.name || sv.url.slice(0, 60))}</div>
+                        <div class="t" title="${esc(sv.name || sv.url)}">${esc(sv.name || sv.url.slice(0, 60))}</div>
                         <div class="meta">${esc(host)}${segTxt}${sv.error ? ' · ' + esc(sv.error.slice(0, 60)) : ''}</div>
                         ${pgBar(sv)}
                     </div>
