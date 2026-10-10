@@ -326,12 +326,15 @@ fn create_http_client(referer: &str, cookie: &str, timeout_secs: u64) -> Result<
 /// 在分片/写入检查点快速退出，分片完成时累计进度；CLI 模式传 None。
 /// `display_name` 为视频语义名（来自播放页标题）：提供时输出文件名改为
 /// `{清洗后的语义名}_{url md5 前 8 位}`，未提供时保持 `{extract_video_id}_{md5}`。
+/// `referer_override` 为插件随任务发送的播放页 Referer：提供时跳过 config.yaml
+/// 域名映射直接使用（新站点零配置），CLI 模式传 None。
 pub async fn process_m3u8_batch(
     urls: &[String],
     config: &video_processor::Config,
     download_dir: &Path,
     temp_dir: &Path,
     display_name: Option<&str>,
+    referer_override: Option<&str>,
     signal: Option<Arc<TaskSignal>>,
 ) -> Result<()> {
     // 转为 owned，便于下方 spawn 的下载任务捕获（&引用不能逃逸到 'static 任务）
@@ -368,7 +371,9 @@ pub async fn process_m3u8_batch(
             let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             let downloader =
                 video_processor::cloudflare_bypass::CloudflareBypassDownloader::new(&project_root);
-            let url_referer = get_referer_for_url(m3u8_url, &config);
+            let url_referer = referer_override
+                .map(str::to_string)
+                .unwrap_or_else(|| get_referer_for_url(m3u8_url, &config));
             let url_cookie = get_cookie_for_url(m3u8_url, &config);
             // 智能命名：优先用 URL 中的 UUID，回退到 MD5
             let base_filename = extract_video_id(m3u8_url);
@@ -395,7 +400,10 @@ pub async fn process_m3u8_batch(
         debug!("处理 M3U8 文件 [{}/{}]: {}", i + 1, urls.len(), m3u8_url);
 
         // 根据当前 URL 的域名获取对应的 Referer 和 Cookie，并创建专用的 client
-        let url_referer = get_referer_for_url(m3u8_url, &config);
+        // （插件任务带 referer_override 时直接使用，跳过域名映射——新站点零配置）
+        let url_referer = referer_override
+            .map(str::to_string)
+            .unwrap_or_else(|| get_referer_for_url(m3u8_url, &config));
         let url_cookie = get_cookie_for_url(m3u8_url, &config);
         info!("URL {} 使用 Referer: {}", m3u8_url, url_referer);
         if !url_cookie.is_empty() {
@@ -1303,6 +1311,7 @@ async fn main() -> Result<()> {
         &config,
         &download_dir,
         &temp_dir,
+        None,
         None,
         None,
     )

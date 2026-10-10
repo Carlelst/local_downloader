@@ -46,6 +46,10 @@ struct DownloadRequest {
     /// 视频语义名（来自播放页标题），作为输出文件名前缀；缺省时回退 URL 提取
     #[serde(default)]
     name: Option<String>,
+    /// 播放页 Referer（插件捕获时带上 document.origin）：插件发送则优先使用，
+    /// 缺省/为空回退 config.yaml 域名映射——新站点因此无需改配置即可下载
+    #[serde(default)]
+    referer: Option<String>,
 }
 
 /// /cancel 与 /forget 共用的请求体
@@ -318,7 +322,14 @@ async fn handle_download(
         }};
     }
 
-    let referer = get_referer_for_url(&url, config);
+    // Referer 优先级：插件随任务发送的播放页 origin > config.yaml 域名映射（CLI/旧插件回退）
+    let referer = req
+        .referer
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| get_referer_for_url(&url, config));
     let cookie = get_cookie_for_url(&url, config);
     let client = match create_http_client(&referer, &cookie, config.segment_timeout) {
         Ok(c) => Arc::new(c),
@@ -354,6 +365,7 @@ async fn handle_download(
     let video_slots = Arc::clone(video_slots);
     let task_url = url.clone();
     let task_key = key.clone();
+    let task_referer = referer.clone();
     tokio::spawn(async move {
         // 等待空闲许可；排队期间被取消则直接出队
         let _permit = tokio::select! {
@@ -402,6 +414,7 @@ async fn handle_download(
                     &download_dir,
                     &temp_dir,
                     Some(display.as_str()),
+                    Some(task_referer.as_str()),
                     Some(Arc::clone(&signal)),
                 )
                 .await

@@ -1,21 +1,9 @@
 // ==UserScript==
 // @name         rou.video 悬浮球下载器
 // @namespace    https://rou.video/
-// @version      2.2.8
-// @description  在 rou.video / missav 播放页右下角显示悬浮球：自动捕获视频地址并暂存为任务（跨页面持久化），点击球打开管理面板：批量发送下载、实时查看服务端进度、取消/重试、手动添加地址
-// @match        https://rou.video/*
-// @match        https://www.rou.video/*
-// @match        https://missav.ws/*
-// @match        https://www.missav.ws/*
-// @match        https://missav.ai/*
-// @match        https://www.missav.ai/*
-// @match        https://kanav.ad/*
-// @match        https://www.kanav.ad/*
-// @match        https://m1.kanav.fun/*
-// @match        https://91quanji.com/*
-// @match        https://www.91quanji.com/*
-// @match        https://avgood.com/*
-// @match        https://www.avgood.com/*
+// @version      2.3.0
+// @description  全站通用视频地址捕获器：自动捕获 m3u8/伪装流地址并暂存为任务（跨页面持久化），点击球打开管理面板：批量发送下载、实时查看服务端进度、取消/重试、手动添加地址。悬浮球默认隐藏——本页捕获到视频地址或按 Alt+V 后出现
+// @match        *://*/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
@@ -197,6 +185,16 @@
     let ballEl = null;      // 球在 shadow DOM 里，保存直接引用
     let badgeEl = null;     // 角标
     let onTasksChanged = null; // 任务变动回调（顶层用于刷新角标/面板）
+    let hostEl = null;      // shadow 宿主：通用模式下整体显隐（球默认隐藏，避免打扰非视频站点）
+    let ballVisible = false; // 本页是否已显示球（首次捕获 或 Alt+V）
+    let pollingStarter = null; // mount() 里赋值：角标/状态轮询的惰性启动器（球显示时才跑，全站注入下避免无谓请求）
+
+    // 显示悬浮球（通用模式：默认隐藏）。捕获路径（本页或 iframe postMessage）与 Alt+V 都会调用
+    function showBall() {
+        ballVisible = true;
+        if (hostEl) hostEl.style.display = '';
+        if (pollingStarter) pollingStarter();
+    }
 
     function notifyTasksChanged() {
         if (onTasksChanged) { try { onTasksChanged(); } catch (e) { /* 忽略 */ } }
@@ -211,6 +209,7 @@
             const r = addTask(clean, title);
             if (r === 'new') {
                 console.log('[rou-dl] ✓ 已捕获并暂存 (' + source + '):', clean);
+                showBall(); // 通用模式：本页首次捕获到视频地址才显示悬浮球
                 notifyTasksChanged();
                 reportToTop(clean);
                 // 捕获发生时页面 title 可能尚未就绪（播放器 iframe 先加载/标题后设置），
@@ -477,6 +476,9 @@
         shadow.append(style, ball, badge, tip, panel);
         ballEl = ball;
         badgeEl = badge;
+        hostEl = host0;
+        // 通用模式：球默认隐藏（非视频站点不打扰），首次捕获或 Alt+V 后显示
+        if (!ballVisible) host0.style.display = 'none';
 
         function showTip(text, color) {
             tip.textContent = text;
@@ -848,7 +850,9 @@
                     url: SERVER + '/download',
                     headers: { 'Content-Type': 'application/json' },
                     // name = 视频标题：服务端用它做输出文件名（清洗非法字符+防撞哈希）
-                    data: JSON.stringify({ url: t.url, name: t.name || t.title || '' }),
+                    // referer = 当前播放页 origin：服务端优先用它发请求（新站点免配置），
+                    // 缺省时服务端回退 config.yaml 域名映射
+                    data: JSON.stringify({ url: t.url, name: t.name || t.title || '', referer: location.origin + '/' }),
                     timeout: 30000,
                     onload: (resp) => {
                         let data = {};
@@ -928,7 +932,6 @@
             if (!document.documentElement) return false;
             // 挂 <html>（防 SPA 重建 body 删除）+ Shadow DOM（防广告拦截器 cosmetic 规则）
             document.documentElement.append(host0);
-            console.log('[rou-dl] 悬浮球已挂载 @', location.href);
             return true;
         }
         if (!mountBall()) {
@@ -944,12 +947,21 @@
         if (document.documentElement) startObserver();
         else document.addEventListener('DOMContentLoaded', startObserver, { once: true });
 
-        // 角标轮询：其他页面/frame 写入 GM 存储后这里也能看到（GM 存储全局共享）
-        setInterval(refreshBadge, 2000);
-        refreshBadge();
-        // 服务端任务状态轮询（面板进度 / 取消 / 重试的数据源）
-        pollStatus();
-        setInterval(pollStatus, 2000);
+        // 角标轮询：其他页面/frame 写入 GM 存储后这里也能看到（GM 存储全局共享）。
+        // 通用模式（全站注入）下惰性启动：球显示后才轮询，避免每个网站都打本地服务
+        pollingStarter = (() => {
+            let started = false;
+            return () => {
+                if (started) return;
+                started = true;
+                setInterval(refreshBadge, 2000);
+                refreshBadge();
+                // 服务端任务状态轮询（面板进度 / 取消 / 重试的数据源）
+                pollStatus();
+                setInterval(pollStatus, 2000);
+            };
+        })();
+        if (ballVisible) pollingStarter();
         window.addEventListener('load', () => { scanPageSource(); refreshBadge(); });
     }
 
@@ -960,9 +972,21 @@
         window.addEventListener('message', (e) => {
             const d = e.data;
             if (d && typeof d === 'object' && d.__rdCapture) {
+                showBall(); // iframe 捕获到视频 → 顶层也显示球
                 notifyTasksChanged();
             }
         });
+
+        // Alt+V：手动呼出（打开面板，可手动添加地址）；球已显示时直接切换面板
+        if (IS_TOP) {
+            window.addEventListener('keydown', (e) => {
+                if (e.altKey && !e.ctrlKey && !e.metaKey && (e.key === 'v' || e.key === 'V')) {
+                    e.preventDefault();
+                    if (!ballVisible) showBall();
+                    if (ballEl) ballEl.click();
+                }
+            });
+        }
 
         if (IS_TOP) {
             mount(); // 悬浮球只挂在顶层；iframe 实例只负责捕获（写 GM 存储）
@@ -980,6 +1004,9 @@
         let replayTimer = null;
         function replayOnce() {
             if (document.visibilityState !== 'visible') return;
+            // 通用模式（全站注入）：只对视频页做 API 重放——页面上还没有 <video>
+            // 说明不是播放页，重放任意站点的 API 端点既无意义也不礼貌
+            try { if (!document.querySelector('video')) return; } catch (e) { /* 忽略 */ }
             replayTries++;
             if (replayTries > REPLAY_MAX_TRIES) {
                 if (replayTimer) { clearInterval(replayTimer); replayTimer = null; }
